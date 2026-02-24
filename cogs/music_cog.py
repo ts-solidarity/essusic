@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 import discord
 from discord import app_commands
@@ -67,6 +69,50 @@ class SearchView(discord.ui.View):
     async def on_timeout(self) -> None:
         for item in self.children:
             item.disabled = True  # type: ignore[union-attr]
+        try:
+            await self.original_interaction.edit_original_response(view=self)
+        except discord.HTTPException:
+            pass
+
+
+class MixConfirmView(discord.ui.View):
+    """Asks the user whether to play a YouTube Mix or just the single video."""
+
+    def __init__(self, cog: MusicCog, interaction: discord.Interaction, url: str) -> None:
+        super().__init__(timeout=30)
+        self.cog = cog
+        self.original_interaction = interaction
+        self.url = url
+
+    @discord.ui.button(label="Play just this video", style=discord.ButtonStyle.primary)
+    async def play_video(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer()
+        self._disable_all()
+        await self.original_interaction.edit_original_response(view=self)
+        # Strip list= params to get just the video URL
+        parsed = urlparse(self.url)
+        params = parse_qs(parsed.query)
+        video_id = params.get("v", [None])[0]
+        if video_id:
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+        else:
+            video_url = self.url
+        # Re-invoke play logic as a YouTube URL
+        await self.cog._play_single_url(interaction, video_url)
+
+    @discord.ui.button(label="Load the mix anyway", style=discord.ButtonStyle.secondary)
+    async def play_mix(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer()
+        self._disable_all()
+        await self.original_interaction.edit_original_response(view=self)
+        await self.cog._play_youtube_playlist(interaction, self.url)
+
+    def _disable_all(self) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore[union-attr]
+
+    async def on_timeout(self) -> None:
+        self._disable_all()
         try:
             await self.original_interaction.edit_original_response(view=self)
         except discord.HTTPException:
@@ -165,6 +211,98 @@ class MusicCog(commands.Cog):
         else:
             await interaction.response.send_message(msg)
 
+    async def _play_youtube_playlist(
+        self, interaction: discord.Interaction, url: str
+    ) -> None:
+        """Fetch a YouTube playlist and queue all its tracks."""
+        try:
+            import yt_dlp
+            from music.audio_source import YTDL_OPTIONS
+
+            ytdl = yt_dlp.YoutubeDL(
+                {
+                    **YTDL_OPTIONS,
+                    "noplaylist": False,
+                    "extract_flat": "in_playlist",
+                    "extractor_args": {"youtubetab": {"skip": ["authcheck"]}},
+                }
+            )
+            data = await self.bot.loop.run_in_executor(
+                None, lambda: ytdl.extract_info(url, download=False)
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"Could not load playlist: {exc}")
+            return
+
+        entries = data.get("entries") or []
+        if not entries:
+            await interaction.followup.send("No tracks found in that playlist.")
+            return
+
+        vc = await self._ensure_voice(interaction)
+        if vc is None:
+            return
+
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        count = 0
+        skipped = 0
+        for entry in entries:
+            if entry is None:
+                continue
+            video_id = entry.get("id", "")
+            if video_id:
+                entry_url = f"https://www.youtube.com/watch?v={video_id}"
+            else:
+                entry_url = entry.get("webpage_url") or entry.get("url", "")
+            track = TrackInfo(
+                title=entry.get("title", "Unknown"),
+                url=entry_url,
+                duration=int(entry.get("duration", 0) or 0),
+                thumbnail=entry.get("thumbnail", ""),
+                requester=interaction.user.display_name,
+            )
+            if gq.add(track) is None:
+                skipped = sum(1 for e in entries if e is not None) - count
+                break
+            count += 1
+
+        if not vc.is_playing() and not vc.is_paused():
+            await self._play_next(interaction.guild)  # type: ignore[arg-type]
+
+        playlist_title = data.get("title", "YouTube playlist")
+        msg = f"Queued **{count} tracks** from **{playlist_title}**."
+        if skipped:
+            msg += f" ({skipped} skipped — queue full)"
+        await interaction.followup.send(msg)
+
+    async def _play_single_url(
+        self, interaction: discord.Interaction, url: str
+    ) -> None:
+        """Resolve a single YouTube URL or search query and queue it."""
+        try:
+            import yt_dlp
+            from music.audio_source import YTDL_OPTIONS
+
+            ytdl = yt_dlp.YoutubeDL({**YTDL_OPTIONS, "skip_download": True})
+            data = await self.bot.loop.run_in_executor(
+                None, lambda: ytdl.extract_info(url, download=False)
+            )
+            if "entries" in data:
+                data = data["entries"][0]
+
+            track = TrackInfo(
+                title=data.get("title", "Unknown"),
+                url=data.get("webpage_url", url),
+                duration=int(data.get("duration", 0) or 0),
+                thumbnail=data.get("thumbnail", ""),
+                requester=interaction.user.display_name,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"Could not find anything: {exc}")
+            return
+
+        await self._enqueue_and_play(interaction, track)
+
     # ── commands ─────────────────────────────────────────────────────────
 
     @app_commands.command(name="play", description="Play from a YouTube/Spotify URL or search keywords")
@@ -230,100 +368,29 @@ class MusicCog(commands.Cog):
 
         # YouTube playlist
         if input_type == InputType.YOUTUBE_PLAYLIST:
+            # Detect YouTube Mix (list=RD...) — these are personalized
+            params = parse_qs(urlparse(value).query)
+            list_id = params.get("list", [""])[0]
+            if list_id.startswith("RD"):
+                await interaction.response.send_message(
+                    "This is a **YouTube Mix** — its contents are personalized and "
+                    "may differ from what you see in your browser.\n"
+                    "What would you like to do?",
+                    view=MixConfirmView(self, interaction, value),
+                )
+                return
+
             await interaction.response.defer()
-            try:
-                import yt_dlp
-                from music.audio_source import YTDL_OPTIONS
-
-                ytdl = yt_dlp.YoutubeDL(
-                    {
-                        **YTDL_OPTIONS,
-                        "noplaylist": False,
-                        "extract_flat": "in_playlist",
-                        "extractor_args": {"youtubetab": {"skip": ["authcheck"]}},
-                    }
-                )
-                data = await self.bot.loop.run_in_executor(
-                    None, lambda: ytdl.extract_info(value, download=False)
-                )
-            except Exception as exc:
-                await interaction.followup.send(f"Could not load playlist: {exc}")
-                return
-
-            entries = data.get("entries") or []
-            if not entries:
-                await interaction.followup.send("No tracks found in that playlist.")
-                return
-
-            vc = await self._ensure_voice(interaction)
-            if vc is None:
-                return
-
-            gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
-            count = 0
-            skipped = 0
-            for entry in entries:
-                if entry is None:
-                    continue
-                video_id = entry.get("id", "")
-                if video_id:
-                    url = f"https://www.youtube.com/watch?v={video_id}"
-                else:
-                    url = entry.get("webpage_url") or entry.get("url", "")
-                track = TrackInfo(
-                    title=entry.get("title", "Unknown"),
-                    url=url,
-                    duration=int(entry.get("duration", 0) or 0),
-                    thumbnail=entry.get("thumbnail", ""),
-                    requester=interaction.user.display_name,
-                )
-                if gq.add(track) is None:
-                    skipped = sum(1 for e in entries if e is not None) - count
-                    break
-                count += 1
-
-            if not vc.is_playing() and not vc.is_paused():
-                await self._play_next(interaction.guild)  # type: ignore[arg-type]
-
-            playlist_title = data.get("title", "YouTube playlist")
-            msg = f"Queued **{count} tracks** from **{playlist_title}**."
-            if skipped:
-                msg += f" ({skipped} skipped — queue full)"
-            await interaction.followup.send(msg)
+            await self._play_youtube_playlist(interaction, value)
             return
 
         # YouTube URL or search
         await interaction.response.defer()
-
         if input_type == InputType.SEARCH_QUERY:
             url = f"ytsearch:{value}"
         else:
             url = value
-
-        try:
-            # Peek at metadata to get title, then queue lightweight TrackInfo
-            import yt_dlp
-            from music.audio_source import YTDL_OPTIONS
-
-            ytdl = yt_dlp.YoutubeDL({**YTDL_OPTIONS, "skip_download": True})
-            data = await self.bot.loop.run_in_executor(
-                None, lambda: ytdl.extract_info(url, download=False)
-            )
-            if "entries" in data:
-                data = data["entries"][0]
-
-            track = TrackInfo(
-                title=data.get("title", "Unknown"),
-                url=data.get("webpage_url", url),
-                duration=int(data.get("duration", 0) or 0),
-                thumbnail=data.get("thumbnail", ""),
-                requester=interaction.user.display_name,
-            )
-        except Exception as exc:
-            await interaction.followup.send(f"Could not find anything: {exc}")
-            return
-
-        await self._enqueue_and_play(interaction, track)
+        await self._play_single_url(interaction, url)
 
     @app_commands.command(name="stop", description="Stop playback, clear queue, and disconnect")
     async def stop(self, interaction: discord.Interaction) -> None:
