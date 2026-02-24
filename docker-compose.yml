@@ -4,4 +4,7 @@ services:
     restart: unless-stopped
     env_file: .env
     volumes:
-      - ./data:/data
+      - ytdl-cache:/root/.cache/yt-dlp
+
+volumes:
+  ytdl-cache:

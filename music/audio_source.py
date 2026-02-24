@@ -18,7 +18,8 @@ YTDL_OPTIONS = {
     "no_warnings": True,
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
-    "cookiefile": "/data/cookies.txt",
+    "username": "oauth2",
+    "password": "",
 }
 
 FFMPEG_OPTIONS = {
