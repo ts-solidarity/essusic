@@ -85,10 +85,13 @@ class YTDLSource(discord.PCMVolumeTransformer):
         for entry in data.get("entries", []) or []:
             if entry is None:
                 continue
+            url = entry.get("webpage_url") or entry.get("url", "")
+            if "watch?v=" not in url and "youtu.be/" not in url:
+                continue
             results.append(
                 TrackInfo(
                     title=entry.get("title", "Unknown"),
-                    url=entry.get("webpage_url", ""),
+                    url=url,
                     duration=int(entry.get("duration", 0) or 0),
                     thumbnail=entry.get("thumbnail", ""),
                 )
