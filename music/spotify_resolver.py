@@ -35,6 +35,15 @@ class SpotifyResolver:
         artists = ", ".join(a["name"] for a in track["artists"])
         return f"{artists} - {track['name']}"
 
+    def _track_to_info(self, track: dict) -> TrackInfo:
+        title = self._format_track(track)
+        return TrackInfo(
+            title=title,
+            url=f"ytsearch:{title}",
+            duration=track.get("duration_ms", 0) // 1000,
+            artist=", ".join(a["name"] for a in track.get("artists", [])),
+        )
+
     def search(self, query: str, limit: int = 5) -> list[TrackInfo]:
         """Search Spotify for tracks and return TrackInfo results."""
         if not self._sp:
@@ -79,6 +88,67 @@ class SpotifyResolver:
                     duration=track.get("duration_ms", 0) // 1000,
                 )
         return None
+
+    def recommend_multiple(self, query: str, limit: int = 5) -> list[TrackInfo]:
+        """Search Spotify for a seed track, return multiple recommendations."""
+        if not self._sp:
+            return []
+        results = self._sp.search(q=query, type="track", limit=1)
+        items = results.get("tracks", {}).get("items", [])
+        if not items:
+            return []
+        seed_id = items[0]["id"]
+        recs = self._sp.recommendations(seed_tracks=[seed_id], limit=limit)
+        out: list[TrackInfo] = []
+        for track in recs.get("tracks", []):
+            if track["id"] != seed_id:
+                out.append(self._track_to_info(track))
+        return out
+
+    def recommend_by_seed(
+        self, seed: str, exclude_ids: set[str] | None = None, limit: int = 5
+    ) -> list[tuple[str, TrackInfo]]:
+        """Get recommendations seeded by artist/genre/track name.
+
+        Returns list of (spotify_track_id, TrackInfo) for de-duplication.
+        Tries artist seed first, then genre, then track.
+        """
+        if not self._sp:
+            return []
+        exclude_ids = exclude_ids or set()
+
+        # Try to find an artist
+        artist_results = self._sp.search(q=seed, type="artist", limit=1)
+        artist_items = artist_results.get("artists", {}).get("items", [])
+
+        # Try to find a track as fallback
+        track_results = self._sp.search(q=seed, type="track", limit=1)
+        track_items = track_results.get("tracks", {}).get("items", [])
+
+        kwargs: dict = {"limit": limit + len(exclude_ids)}
+        if artist_items:
+            kwargs["seed_artists"] = [artist_items[0]["id"]]
+        elif track_items:
+            kwargs["seed_tracks"] = [track_items[0]["id"]]
+        else:
+            # Try as genre seed
+            kwargs["seed_genres"] = [seed.lower()]
+
+        try:
+            recs = self._sp.recommendations(**kwargs)
+        except Exception as exc:
+            log.warning("Spotify recommendations failed: %s", exc)
+            return []
+
+        out: list[tuple[str, TrackInfo]] = []
+        for track in recs.get("tracks", []):
+            tid = track["id"]
+            if tid in exclude_ids:
+                continue
+            out.append((tid, self._track_to_info(track)))
+            if len(out) >= limit:
+                break
+        return out
 
     def resolve_track(self, track_id: str) -> list[str]:
         if not self._sp:

@@ -3,13 +3,22 @@ from __future__ import annotations
 import json
 import logging
 import random
-from collections import deque
+import re
+from collections import Counter, deque
 from enum import Enum, auto
 from pathlib import Path
 
 from .audio_source import TrackInfo
 
 log = logging.getLogger(__name__)
+
+_ARTIST_SEP_RE = re.compile(r"\s+[-–—|]\s+")
+
+
+def _extract_artist(title: str) -> str:
+    """Extract artist from 'Artist - Title' style strings."""
+    parts = _ARTIST_SEP_RE.split(title, maxsplit=1)
+    return parts[0].strip().lower() if len(parts) > 1 else ""
 
 
 class LoopMode(Enum):
@@ -51,6 +60,27 @@ class GuildQueue:
         self.text_channel_id: int | None = None
         self._restarting: bool = False
         self.skip_votes: set[int] = set()
+
+        # EQ
+        self.eq_bands: list[float] = [0.0] * 10
+
+        # Radio mode
+        self.radio_mode: bool = False
+        self.radio_seed: str | None = None
+        self.radio_history: set[str] = set()
+
+        # DJ queue mode
+        self.dj_queue_mode: bool = False
+        self.pending_requests: deque[TrackInfo] = deque(maxlen=50)
+
+        # Crossfade
+        self.crossfade_seconds: int = 0
+
+        # Undo stack (in-memory only)
+        self._undo_stack: list[tuple[list[TrackInfo], str]] = []
+
+        # Locale
+        self.locale: str = "en"
 
     def add(self, track: TrackInfo) -> int | None:
         """Add a track and return its position (1-indexed), or None if queue is full."""
@@ -110,14 +140,84 @@ class GuildQueue:
         random.shuffle(items)
         self.queue = deque(items)
 
+    def smart_shuffle(self) -> None:
+        """Shuffle the queue avoiding back-to-back tracks from the same artist."""
+        items = list(self.queue)
+        if len(items) < 2:
+            return
+
+        # Group by artist
+        groups: dict[str, list[TrackInfo]] = {}
+        for track in items:
+            artist = track.artist or _extract_artist(track.title) or f"__unknown_{id(track)}"
+            groups.setdefault(artist, []).append(track)
+
+        # Shuffle within each group
+        for g in groups.values():
+            random.shuffle(g)
+
+        # Interleave: always pick from the largest group that differs from the last
+        result: list[TrackInfo] = []
+        last_artist = ""
+        remaining = {k: deque(v) for k, v in groups.items()}
+
+        while remaining:
+            # Find candidate groups (different from last artist)
+            candidates = {k: v for k, v in remaining.items() if k != last_artist and v}
+            if not candidates:
+                # Forced to pick from same artist (only one group left)
+                candidates = {k: v for k, v in remaining.items() if v}
+            if not candidates:
+                break
+
+            # Pick from largest group
+            best_key = max(candidates, key=lambda k: len(candidates[k]))
+            track = remaining[best_key].popleft()
+            result.append(track)
+            last_artist = best_key
+
+            if not remaining[best_key]:
+                del remaining[best_key]
+
+        self.queue = deque(result)
+
+    def has_duplicate(self, track: TrackInfo) -> bool:
+        """Check if a track URL is already in the queue or currently playing."""
+        if self.current and self.current.url == track.url:
+            return True
+        return any(t.url == track.url for t in self.queue)
+
     def clear(self) -> None:
         self.queue.clear()
         self.current = None
         self.previous = None
         self.loop_mode = LoopMode.OFF
+        self.radio_mode = False
+        self.radio_seed = None
+        self.radio_history.clear()
+
+    # ── Undo ──────────────────────────────────────────────────────────────
+
+    def snapshot(self, description: str) -> None:
+        """Save a snapshot of the current queue for undo."""
+        self._undo_stack.append((list(self.queue), description))
+        if len(self._undo_stack) > 10:
+            self._undo_stack.pop(0)
+
+    def undo(self) -> str | None:
+        """Restore the last queue snapshot. Returns description or None."""
+        if not self._undo_stack:
+            return None
+        items, description = self._undo_stack.pop()
+        self.queue = deque(items)
+        return description
 
 
-_SETTINGS_KEYS = ("volume", "search_mode", "max_queue", "autoplay", "filter_name", "dj_role_id", "stay_connected", "speed", "normalize", "loop_mode")
+_SETTINGS_KEYS = (
+    "volume", "search_mode", "max_queue", "autoplay", "filter_name",
+    "dj_role_id", "stay_connected", "speed", "normalize", "loop_mode",
+    "eq_bands", "crossfade_seconds", "locale",
+)
 
 
 class QueueManager:
@@ -252,20 +352,29 @@ class HistoryManager:
         except Exception as exc:
             log.warning("Failed to save history: %s", exc)
 
-    def record(self, guild_id: int, track: TrackInfo) -> None:
+    def record(
+        self,
+        guild_id: int,
+        track: TrackInfo,
+        requester_id: int = 0,
+        duration: int = 0,
+    ) -> None:
         import time
 
         key = str(guild_id)
         entries = self._data.setdefault(key, [])
-        entries.append({"title": track.title, "url": track.url, "ts": time.time()})
+        entry: dict = {"title": track.title, "url": track.url, "ts": time.time()}
+        if requester_id:
+            entry["user"] = requester_id
+        if duration:
+            entry["dur"] = duration
+        entries.append(entry)
         if len(entries) > 500:
             self._data[key] = entries[-500:]
         self._save()
 
     def top(self, guild_id: int, limit: int = 10) -> list[tuple[str, str, int]]:
         """Return top tracks as (title, url, count) sorted by play count."""
-        from collections import Counter
-
         entries = self._data.get(str(guild_id), [])
         counts: Counter[str] = Counter()
         url_map: dict[str, str] = {}
@@ -274,6 +383,48 @@ class HistoryManager:
             counts[title] += 1
             url_map[title] = e.get("url", "")
         return [(t, url_map[t], c) for t, c in counts.most_common(limit)]
+
+    def user_stats(self, guild_id: int, user_id: int) -> dict:
+        """Return stats for a specific user in a guild."""
+        entries = self._data.get(str(guild_id), [])
+        user_entries = [e for e in entries if e.get("user") == user_id]
+        total_plays = len(user_entries)
+        total_time = sum(e.get("dur", 0) for e in user_entries)
+
+        track_counts: Counter[str] = Counter()
+        for e in user_entries:
+            track_counts[e["title"]] += 1
+
+        top_tracks = track_counts.most_common(10)
+        return {
+            "total_plays": total_plays,
+            "total_time_seconds": total_time,
+            "top_tracks": top_tracks,
+        }
+
+    def server_stats(self, guild_id: int) -> dict:
+        """Return aggregate stats for a guild."""
+        entries = self._data.get(str(guild_id), [])
+        total_plays = len(entries)
+        total_time = sum(e.get("dur", 0) for e in entries)
+
+        track_counts: Counter[str] = Counter()
+        user_counts: Counter[int] = Counter()
+        unique_urls: set[str] = set()
+        for e in entries:
+            track_counts[e["title"]] += 1
+            unique_urls.add(e.get("url", ""))
+            uid = e.get("user")
+            if uid:
+                user_counts[uid] += 1
+
+        return {
+            "total_plays": total_plays,
+            "total_time_seconds": total_time,
+            "unique_tracks": len(unique_urls),
+            "top_tracks": track_counts.most_common(10),
+            "top_users": user_counts.most_common(10),
+        }
 
 
 class FavoritesManager:
@@ -360,6 +511,10 @@ class PlaylistManager:
         except Exception as exc:
             log.warning("Failed to save playlists: %s", exc)
 
+    def _get_playlist(self, guild_id: int, name: str) -> dict | None:
+        guild_pls = self._data.get(str(guild_id), {})
+        return guild_pls.get(name.lower())
+
     def save(
         self, guild_id: int, name: str, tracks: list[TrackInfo], created_by: str
     ) -> str | None:
@@ -376,11 +531,13 @@ class PlaylistManager:
              "thumbnail": t.thumbnail}
             for t in tracks[:self.MAX_TRACKS]
         ]
+        existing = guild_pls.get(name_key, {})
         guild_pls[name_key] = {
             "name": name,
             "tracks": track_list,
             "created_by": created_by,
             "created_at": _time.time(),
+            "collaborators": existing.get("collaborators", []),
         }
         self._write()
         return None
@@ -418,3 +575,140 @@ class PlaylistManager:
         """Return all playlist names for autocomplete."""
         guild_pls = self._data.get(str(guild_id), {})
         return [v["name"] for v in guild_pls.values()]
+
+    # ── Collaborative playlist methods ────────────────────────────────────
+
+    def get_creator(self, guild_id: int, name: str) -> str | None:
+        """Return the creator of a playlist, or None if not found."""
+        entry = self._get_playlist(guild_id, name)
+        if entry is None:
+            return None
+        return entry.get("created_by")
+
+    def get_collaborators(self, guild_id: int, name: str) -> list[int]:
+        entry = self._get_playlist(guild_id, name)
+        if entry is None:
+            return []
+        return entry.get("collaborators", [])
+
+    def is_collaborator(self, guild_id: int, name: str, user_id: int) -> bool:
+        return user_id in self.get_collaborators(guild_id, name)
+
+    def add_collaborator(self, guild_id: int, name: str, user_id: int) -> bool:
+        """Add a collaborator. Returns False if not found or already added."""
+        entry = self._get_playlist(guild_id, name)
+        if entry is None:
+            return False
+        collabs = entry.setdefault("collaborators", [])
+        if user_id in collabs:
+            return False
+        collabs.append(user_id)
+        self._write()
+        return True
+
+    def remove_collaborator(self, guild_id: int, name: str, user_id: int) -> bool:
+        """Remove a collaborator. Returns False if not found."""
+        entry = self._get_playlist(guild_id, name)
+        if entry is None:
+            return False
+        collabs = entry.get("collaborators", [])
+        if user_id not in collabs:
+            return False
+        collabs.remove(user_id)
+        self._write()
+        return True
+
+    def add_track_to_playlist(
+        self, guild_id: int, name: str, track: TrackInfo
+    ) -> str | None:
+        """Add a track to a playlist. Returns error string or None on success."""
+        entry = self._get_playlist(guild_id, name)
+        if entry is None:
+            return "Playlist not found."
+        tracks = entry.get("tracks", [])
+        if len(tracks) >= self.MAX_TRACKS:
+            return f"Playlist is full ({self.MAX_TRACKS} tracks max)."
+        tracks.append({
+            "title": track.title, "url": track.url,
+            "duration": track.duration, "thumbnail": track.thumbnail,
+        })
+        self._write()
+        return None
+
+    def remove_track_from_playlist(
+        self, guild_id: int, name: str, index: int
+    ) -> dict | None:
+        """Remove a track by 0-based index. Returns removed track dict or None."""
+        entry = self._get_playlist(guild_id, name)
+        if entry is None:
+            return None
+        tracks = entry.get("tracks", [])
+        if index < 0 or index >= len(tracks):
+            return None
+        removed = tracks.pop(index)
+        self._write()
+        return removed
+
+
+class RatingsManager:
+    """Per-guild track ratings with up/down votes."""
+
+    def __init__(self, path: str = "/data/ratings.json") -> None:
+        self._path = Path(path)
+        self._data: dict[str, dict[str, dict]] = {}
+        if self._path.exists():
+            try:
+                self._data = json.loads(self._path.read_text())
+            except Exception as exc:
+                log.warning("Failed to load ratings: %s", exc)
+
+    def _save(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(self._data, indent=2))
+        except Exception as exc:
+            log.warning("Failed to save ratings: %s", exc)
+
+    def vote(
+        self, guild_id: int, track_url: str, title: str,
+        user_id: int, direction: str,
+    ) -> tuple[int, int]:
+        """Toggle a vote. direction is 'up' or 'down'. Returns (up_count, down_count)."""
+        key = str(guild_id)
+        guild_data = self._data.setdefault(key, {})
+        entry = guild_data.setdefault(track_url, {
+            "title": title, "up": 0, "down": 0, "voters": {},
+        })
+        voters = entry.setdefault("voters", {})
+        uid = str(user_id)
+
+        prev = voters.get(uid)
+        if prev == direction:
+            # Toggle off
+            entry[direction] = max(0, entry[direction] - 1)
+            del voters[uid]
+        else:
+            # Remove old vote if switching
+            if prev:
+                entry[prev] = max(0, entry[prev] - 1)
+            entry[direction] += 1
+            voters[uid] = direction
+
+        self._save()
+        return entry["up"], entry["down"]
+
+    def get_rating(self, guild_id: int, track_url: str) -> tuple[int, int]:
+        entry = self._data.get(str(guild_id), {}).get(track_url)
+        if entry is None:
+            return 0, 0
+        return entry.get("up", 0), entry.get("down", 0)
+
+    def top_rated(self, guild_id: int, limit: int = 10) -> list[tuple[str, str, int, int]]:
+        """Return top rated tracks as (title, url, up, down) sorted by net score."""
+        guild_data = self._data.get(str(guild_id), {})
+        items = [
+            (v["title"], url, v.get("up", 0), v.get("down", 0))
+            for url, v in guild_data.items()
+        ]
+        items.sort(key=lambda x: x[2] - x[3], reverse=True)
+        return items[:limit]

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import math
 import re
@@ -13,13 +15,27 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from music.audio_source import AUDIO_FILTERS, TrackInfo, YTDLSource
+from music.audio_source import (
+    AUDIO_FILTERS,
+    EQ_PRESETS,
+    CrossfadeSource,
+    TrackInfo,
+    YTDLSource,
+)
+from music.metrics import (
+    active_players as metric_active_players,
+    playback_errors_total,
+    queue_size as metric_queue_size,
+    tracks_played_total,
+    voice_connections as metric_voice_connections,
+)
 from music.queue_manager import (
     FavoritesManager,
     GuildQueue,
     HistoryManager,
     PlaylistManager,
     QueueManager,
+    RatingsManager,
 )
 from music.spotify_resolver import SpotifyResolver
 from music.url_parser import InputType, classify
@@ -209,6 +225,97 @@ class VoteSkipView(discord.ui.View):
             item.disabled = True  # type: ignore[union-attr]
 
 
+class RateView(discord.ui.View):
+    """Thumbs up/down rating buttons for the current track."""
+
+    def __init__(self, cog: MusicCog, guild_id: int, track_url: str, track_title: str) -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.track_url = track_url
+        self.track_title = track_title
+        up, down = self.cog.ratings.get_rating(guild_id, track_url)
+        self.up_btn.label = f"\U0001f44d {up}"
+        self.down_btn.label = f"\U0001f44e {down}"
+
+    @discord.ui.button(label="\U0001f44d 0", style=discord.ButtonStyle.success)
+    async def up_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        up, down = self.cog.ratings.vote(
+            self.guild_id, self.track_url, self.track_title,
+            interaction.user.id, "up",
+        )
+        self.up_btn.label = f"\U0001f44d {up}"
+        self.down_btn.label = f"\U0001f44e {down}"
+        await interaction.response.edit_message(view=self)
+
+    @discord.ui.button(label="\U0001f44e 0", style=discord.ButtonStyle.danger)
+    async def down_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        up, down = self.cog.ratings.vote(
+            self.guild_id, self.track_url, self.track_title,
+            interaction.user.id, "down",
+        )
+        self.up_btn.label = f"\U0001f44d {up}"
+        self.down_btn.label = f"\U0001f44e {down}"
+        await interaction.response.edit_message(view=self)
+
+
+class DJApprovalView(discord.ui.View):
+    """Approve/reject a track request in DJ queue mode."""
+
+    def __init__(self, cog: MusicCog, guild: discord.Guild, track: TrackInfo) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild = guild
+        self.track = track
+
+    @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        gq = self.cog.queues.get(self.guild.id)
+        if err := _check_dj(interaction, gq):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        pos = gq.add(self.track)
+        if pos is None:
+            await interaction.response.send_message("Queue is full.", ephemeral=True)
+            return
+        # Remove from pending
+        try:
+            gq.pending_requests.remove(self.track)
+        except ValueError:
+            pass
+        self._disable_all()
+        await interaction.response.edit_message(
+            content=f"Approved **{self.track.title}** (position #{pos}).",
+            view=self,
+        )
+        vc: Optional[discord.VoiceClient] = self.guild.voice_client  # type: ignore[assignment]
+        if vc and not vc.is_playing() and not vc.is_paused():
+            await self.cog._play_next(self.guild)
+
+    @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger)
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        gq = self.cog.queues.get(self.guild.id)
+        if err := _check_dj(interaction, gq):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        try:
+            gq.pending_requests.remove(self.track)
+        except ValueError:
+            pass
+        self._disable_all()
+        await interaction.response.edit_message(
+            content=f"Rejected **{self.track.title}**.",
+            view=self,
+        )
+
+    def _disable_all(self) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore[union-attr]
+
+    async def on_timeout(self) -> None:
+        self._disable_all()
+
+
 class PlayerView(discord.ui.View):
     """Interactive music player with controls, progress bar, and seek."""
 
@@ -218,6 +325,14 @@ class PlayerView(discord.ui.View):
         self.guild = guild
         self.message: discord.Message | None = None
         self._update_task: asyncio.Task | None = None
+        self._build_seek_menu()
+
+    def _build_seek_menu_safe(self) -> None:
+        """Rebuild the seek menu, removing the old one first."""
+        # Remove old select menu
+        to_remove = [c for c in self.children if isinstance(c, discord.ui.Select)]
+        for c in to_remove:
+            self.remove_item(c)
         self._build_seek_menu()
 
     def _build_seek_menu(self) -> None:
@@ -423,6 +538,30 @@ class PlayerView(discord.ui.View):
         await asyncio.sleep(1.5)
         await self._refresh()
 
+    # Row 2: volume controls
+
+    @discord.ui.button(emoji="\U0001f509", style=discord.ButtonStyle.secondary, row=2)
+    async def vol_down_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        gq = self.cog.queues.get(self.guild.id)
+        gq.volume = max(0.0, round(gq.volume - 0.1, 2))
+        vc: Optional[discord.VoiceClient] = self.guild.voice_client  # type: ignore[assignment]
+        if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
+            vc.source.volume = gq.volume
+        self.cog.queues.save_settings()
+        await interaction.response.defer()
+        await self._refresh()
+
+    @discord.ui.button(emoji="\U0001f50a", style=discord.ButtonStyle.secondary, row=2)
+    async def vol_up_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        gq = self.cog.queues.get(self.guild.id)
+        gq.volume = min(1.0, round(gq.volume + 0.1, 2))
+        vc: Optional[discord.VoiceClient] = self.guild.voice_client  # type: ignore[assignment]
+        if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
+            vc.source.volume = gq.volume
+        self.cog.queues.save_settings()
+        await interaction.response.defer()
+        await self._refresh()
+
 
 class QueueView(discord.ui.View):
     """Paginated queue display with navigation buttons."""
@@ -494,7 +633,9 @@ class MusicCog(commands.Cog):
         self.history = HistoryManager()
         self.favorites = FavoritesManager()
         self.playlists = PlaylistManager()
+        self.ratings = RatingsManager()
         self._active_players: dict[int, PlayerView] = {}
+        self._crossfade_timers: dict[int, asyncio.TimerHandle] = {}
 
     # ── helpers ──────────────────────────────────────────────────────────
 
@@ -519,6 +660,7 @@ class MusicCog(commands.Cog):
 
         if vc is None:
             vc = await channel.connect(self_deaf=True)
+            metric_voice_connections.inc()
         elif vc.channel != channel:
             await vc.move_to(channel)
 
@@ -568,8 +710,30 @@ class MusicCog(commands.Cog):
 
         track = gq.next_track()
         if track is None:
+            # Radio mode: continuously queue similar tracks
+            if gq.radio_mode and self.spotify.available and gq.radio_seed:
+                try:
+                    results = await self.bot.loop.run_in_executor(
+                        None,
+                        lambda: self.spotify.recommend_by_seed(
+                            gq.radio_seed, gq.radio_history, 1  # type: ignore[arg-type]
+                        ),
+                    )
+                    if results:
+                        tid, rec = results[0]
+                        gq.radio_history.add(tid)
+                        if len(gq.radio_history) > 200:
+                            gq.radio_history = set(list(gq.radio_history)[-200:])
+                        gq.add(rec)
+                        track = gq.next_track()
+                        await self._notify_text_channel(
+                            guild, f"Radio: queued **{rec.title}**"
+                        )
+                except Exception as exc:
+                    log.warning("Radio recommendation failed: %s", exc)
+
             # Autoplay: recommend a track based on what just played
-            if gq.autoplay and self.spotify.available and gq.current is not None:
+            if track is None and gq.autoplay and self.spotify.available and gq.current is not None:
                 try:
                     rec = await self.bot.loop.run_in_executor(
                         None, self.spotify.recommend, gq.current.title
@@ -584,6 +748,7 @@ class MusicCog(commands.Cog):
                     log.warning("Autoplay recommendation failed: %s", exc)
 
             if track is None:
+                metric_active_players.dec()
                 self.queues.save_queue_state(guild.id)
                 await self._update_presence(None)
                 if not gq.stay_connected:
@@ -595,20 +760,50 @@ class MusicCog(commands.Cog):
                 track.url, loop=self.bot.loop, volume=gq.volume,
                 filter_name=gq.filter_name,
                 speed=gq.speed, normalize=gq.normalize,
+                eq_bands=gq.eq_bands if any(g != 0 for g in gq.eq_bands) else None,
+                is_live=track.is_live,
             )
         except Exception as exc:
             log.error("Failed to create source for %s: %s", track.title, exc)
+            playback_errors_total.inc()
             await self._notify_text_channel(
                 guild, f"Failed to play **{track.title}**, skipping..."
             )
             await self._play_next(guild)
             return
 
+        tracks_played_total.inc()
+        metric_active_players.inc()
+        metric_queue_size.labels(guild_id=str(guild.id)).set(len(gq.queue))
         gq.play_start_time = time.time()
-        self.history.record(guild.id, track)
+        self.history.record(
+            guild.id, track,
+            requester_id=track.requester_id,
+            duration=track.duration,
+        )
         self.queues.save_queue_state(guild.id)
         vc.play(source, after=lambda e: self._after_play(guild, e))
         await self._update_presence(track)
+
+        # Schedule crossfade if enabled and track has known duration
+        self._cancel_crossfade_timer(guild.id)
+        if (
+            gq.crossfade_seconds > 0
+            and track.duration > 0
+            and not track.is_live
+            and gq.queue
+        ):
+            delay = max(0, (track.duration / gq.speed) - gq.crossfade_seconds)
+            handle = self.bot.loop.call_later(
+                delay, lambda: asyncio.ensure_future(self._start_crossfade(guild))
+            )
+            self._crossfade_timers[guild.id] = handle
+
+        # Auto-refresh active player view
+        pv = self._active_players.get(guild.id)
+        if pv and not pv.is_finished():
+            pv._build_seek_menu_safe()
+            asyncio.ensure_future(pv._refresh())
 
     async def _update_presence(self, track: TrackInfo | None) -> None:
         if track:
@@ -619,6 +814,62 @@ class MusicCog(commands.Cog):
             activity = None
         await self.bot.change_presence(activity=activity)
 
+    def _cancel_crossfade_timer(self, guild_id: int) -> None:
+        handle = self._crossfade_timers.pop(guild_id, None)
+        if handle:
+            handle.cancel()
+
+    async def _start_crossfade(self, guild: discord.Guild) -> None:
+        """Begin crossfade from current track to next."""
+        gq = self.queues.get(guild.id)
+        vc: Optional[discord.VoiceClient] = guild.voice_client  # type: ignore[assignment]
+        if vc is None or not vc.is_playing() or not gq.queue:
+            return
+
+        next_track = gq.queue[0]
+        try:
+            incoming = await YTDLSource.from_query(
+                next_track.url, loop=self.bot.loop, volume=gq.volume,
+                filter_name=gq.filter_name,
+                speed=gq.speed, normalize=gq.normalize,
+                eq_bands=gq.eq_bands if any(g != 0 for g in gq.eq_bands) else None,
+                is_live=next_track.is_live,
+            )
+        except Exception as exc:
+            log.warning("Crossfade pre-fetch failed: %s", exc)
+            return
+
+        outgoing = vc.source
+        xfade = CrossfadeSource(outgoing, incoming, gq.crossfade_seconds)
+        xfade_vol = discord.PCMVolumeTransformer(xfade, volume=gq.volume)
+
+        gq._restarting = True
+        vc.stop()
+
+        # Advance queue
+        gq.previous = gq.current
+        gq.current = gq.queue.popleft()
+        gq.skip_votes.clear()
+        gq.play_start_time = time.time()
+        self.history.record(
+            guild.id, gq.current,
+            requester_id=gq.current.requester_id,
+            duration=gq.current.duration,
+        )
+        self.queues.save_queue_state(guild.id)
+
+        vc.play(xfade_vol, after=lambda e: self._after_play(guild, e))
+        gq._restarting = False
+        await self._update_presence(gq.current)
+
+        # Schedule next crossfade
+        if gq.crossfade_seconds > 0 and gq.current.duration > 0 and gq.queue:
+            delay = max(0, (gq.current.duration / gq.speed) - gq.crossfade_seconds)
+            handle = self.bot.loop.call_later(
+                delay, lambda: asyncio.ensure_future(self._start_crossfade(guild))
+            )
+            self._crossfade_timers[guild.id] = handle
+
     async def _restart_playback(
         self, guild: discord.Guild, seek_seconds: int = 0
     ) -> None:
@@ -627,6 +878,9 @@ class MusicCog(commands.Cog):
         vc: Optional[discord.VoiceClient] = guild.voice_client  # type: ignore[assignment]
         if vc is None or gq.current is None:
             return
+
+        eq = gq.eq_bands if any(g != 0 for g in gq.eq_bands) else None
+        is_live = gq.current.is_live
 
         # Get the stream URL from the current source if available
         current_source = vc.source
@@ -647,6 +901,8 @@ class MusicCog(commands.Cog):
                 seek_seconds=seek_seconds,
                 speed=gq.speed,
                 normalize=gq.normalize,
+                eq_bands=eq,
+                is_live=is_live,
             )
         else:
             source = await YTDLSource.from_query(
@@ -657,6 +913,8 @@ class MusicCog(commands.Cog):
                 seek_seconds=seek_seconds,
                 speed=gq.speed,
                 normalize=gq.normalize,
+                eq_bands=eq,
+                is_live=is_live,
             )
 
         gq.play_start_time = time.time() - (seek_seconds / gq.speed)
@@ -672,6 +930,28 @@ class MusicCog(commands.Cog):
 
         gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
         gq.text_channel_id = interaction.channel_id
+
+        # DJ queue mode: non-DJs submit requests for approval
+        if gq.dj_queue_mode and _check_dj(interaction, gq) is not None:
+            gq.pending_requests.append(track)
+            msg = f"**{track.title}** submitted for DJ approval."
+            if interaction.response.is_done():
+                await interaction.followup.send(msg)
+            else:
+                await interaction.response.send_message(msg)
+            # Send approval view to text channel
+            if gq.text_channel_id:
+                channel = interaction.guild.get_channel(gq.text_channel_id)  # type: ignore[union-attr]
+                if channel and hasattr(channel, "send"):
+                    view = DJApprovalView(self, interaction.guild, track)  # type: ignore[arg-type]
+                    await channel.send(  # type: ignore[union-attr]
+                        f"**DJ Approval Required:** {track.title} (requested by {track.requester})",
+                        view=view,
+                    )
+            return
+
+        # Duplicate detection
+        is_dup = gq.has_duplicate(track)
         pos = gq.add(track)
         self.queues.save_queue_state(interaction.guild.id)  # type: ignore[union-attr]
 
@@ -688,6 +968,10 @@ class MusicCog(commands.Cog):
             msg = f"Now playing: **{track.title}**"
         else:
             msg = f"Queued **{track.title}** at position #{pos}"
+            if is_dup:
+                msg += "\n**{title}** is already in the queue. Adding anyway.".format(
+                    title=track.title
+                )
 
         if interaction.response.is_done():
             await interaction.followup.send(msg)
@@ -800,6 +1084,8 @@ class MusicCog(commands.Cog):
                 duration=int(data.get("duration", 0) or 0),
                 thumbnail=data.get("thumbnail", ""),
                 requester=interaction.user.display_name,
+                artist=data.get("artist", "") or data.get("uploader", "") or "",
+                requester_id=interaction.user.id,
             )
         except Exception as exc:
             await interaction.followup.send(f"Could not find anything: {exc}")
@@ -909,6 +1195,20 @@ class MusicCog(commands.Cog):
             await self._play_youtube_playlist(interaction, value)
             return
 
+        # Radio/live stream
+        if input_type == InputType.RADIO_STREAM:
+            await interaction.response.defer()
+            track = TrackInfo(
+                title=value.split("/")[-1] or "Live Stream",
+                url=value,
+                duration=0,
+                requester=interaction.user.display_name,
+                requester_id=interaction.user.id,
+                is_live=True,
+            )
+            await self._enqueue_and_play(interaction, track)
+            return
+
         # SoundCloud
         if input_type == InputType.SOUNDCLOUD_URL:
             await interaction.response.defer()
@@ -941,8 +1241,11 @@ class MusicCog(commands.Cog):
 
         gq.clear()
         self.queues.clear_queue_state(interaction.guild.id)  # type: ignore[union-attr]
+        self._cancel_crossfade_timer(interaction.guild.id)  # type: ignore[union-attr]
         vc.stop()
         await vc.disconnect()
+        metric_voice_connections.dec()
+        metric_active_players.dec()
         self.queues.remove(interaction.guild.id)  # type: ignore[union-attr]
         await self._update_presence(None)
         await interaction.response.send_message("Stopped and disconnected.")
@@ -1180,6 +1483,7 @@ class MusicCog(commands.Cog):
         if err := _check_dj(interaction, gq):
             await interaction.response.send_message(err, ephemeral=True)
             return
+        gq.snapshot(f"Removed #{position}")
         removed = gq.remove_at(position - 1)
         if removed is None:
             await interaction.response.send_message(
@@ -1222,6 +1526,7 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("Not connected.", ephemeral=True)
             return
 
+        gq.snapshot(f"Skip to #{position}")
         target = gq.skip_to(position - 1)
         if target is None:
             await interaction.response.send_message(
@@ -1244,6 +1549,7 @@ class MusicCog(commands.Cog):
         if count == 0:
             await interaction.response.send_message("Queue is already empty.", ephemeral=True)
             return
+        gq.snapshot("Clear queue")
         gq.queue.clear()
         self.queues.save_queue_state(interaction.guild.id)  # type: ignore[union-attr]
         await interaction.response.send_message(f"Cleared **{count}** tracks from the queue.")
@@ -1259,7 +1565,8 @@ class MusicCog(commands.Cog):
                 "Not enough tracks to shuffle.", ephemeral=True
             )
             return
-        gq.shuffle()
+        gq.snapshot("Shuffle")
+        gq.smart_shuffle()
         self.queues.save_queue_state(interaction.guild.id)  # type: ignore[union-attr]
         await interaction.response.send_message(f"Shuffled **{len(gq.queue)}** tracks.")
 
@@ -1412,6 +1719,10 @@ class MusicCog(commands.Cog):
         vc: Optional[discord.VoiceClient] = interaction.guild.voice_client  # type: ignore[union-attr, assignment]
         if vc is None or not vc.is_playing():
             await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return
+
+        if gq.current and gq.current.is_live:
+            await interaction.response.send_message("Cannot seek in a live stream.", ephemeral=True)
             return
 
         secs = parse_time(position)
@@ -1815,6 +2126,446 @@ class MusicCog(commands.Cog):
         else:
             await interaction.response.send_message(f"Playlist **{name}** not found.", ephemeral=True)
 
+    # ── collaborative playlists ──────────────────────────────────────────
+
+    @playlist_group.command(name="adduser", description="Add a collaborator to a playlist")
+    @app_commands.describe(name="Playlist name", user="User to add as collaborator")
+    @app_commands.autocomplete(name=_playlist_name_autocomplete)
+    async def playlist_adduser(
+        self, interaction: discord.Interaction, name: str, user: discord.Member
+    ) -> None:
+        guild_id = interaction.guild.id  # type: ignore[union-attr]
+        creator = self.playlists.get_creator(guild_id, name)
+        if creator is None:
+            await interaction.response.send_message(f"Playlist **{name}** not found.", ephemeral=True)
+            return
+        # Only creator or DJ can add collaborators
+        gq = self.queues.get(guild_id)
+        if creator != interaction.user.display_name and _check_dj(interaction, gq) is not None:
+            await interaction.response.send_message("Only the playlist creator or a DJ can add collaborators.", ephemeral=True)
+            return
+        if self.playlists.add_collaborator(guild_id, name, user.id):
+            await interaction.response.send_message(f"Added **{user.display_name}** as collaborator on **{name}**.")
+        else:
+            await interaction.response.send_message("User is already a collaborator.", ephemeral=True)
+
+    @playlist_group.command(name="removeuser", description="Remove a collaborator from a playlist")
+    @app_commands.describe(name="Playlist name", user="User to remove")
+    @app_commands.autocomplete(name=_playlist_name_autocomplete)
+    async def playlist_removeuser(
+        self, interaction: discord.Interaction, name: str, user: discord.Member
+    ) -> None:
+        guild_id = interaction.guild.id  # type: ignore[union-attr]
+        creator = self.playlists.get_creator(guild_id, name)
+        if creator is None:
+            await interaction.response.send_message(f"Playlist **{name}** not found.", ephemeral=True)
+            return
+        gq = self.queues.get(guild_id)
+        if creator != interaction.user.display_name and _check_dj(interaction, gq) is not None:
+            await interaction.response.send_message("Only the playlist creator or a DJ can remove collaborators.", ephemeral=True)
+            return
+        if self.playlists.remove_collaborator(guild_id, name, user.id):
+            await interaction.response.send_message(f"Removed **{user.display_name}** from **{name}**.")
+        else:
+            await interaction.response.send_message("User is not a collaborator.", ephemeral=True)
+
+    @playlist_group.command(name="addtrack", description="Add the current track to a playlist")
+    @app_commands.describe(name="Playlist name")
+    @app_commands.autocomplete(name=_playlist_name_autocomplete)
+    async def playlist_addtrack(self, interaction: discord.Interaction, name: str) -> None:
+        guild_id = interaction.guild.id  # type: ignore[union-attr]
+        gq = self.queues.get(guild_id)
+        if gq.current is None:
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return
+        creator = self.playlists.get_creator(guild_id, name)
+        if creator is None:
+            await interaction.response.send_message(f"Playlist **{name}** not found.", ephemeral=True)
+            return
+        is_creator = creator == interaction.user.display_name
+        is_collab = self.playlists.is_collaborator(guild_id, name, interaction.user.id)
+        if not is_creator and not is_collab:
+            await interaction.response.send_message("You must be the creator or a collaborator.", ephemeral=True)
+            return
+        err = self.playlists.add_track_to_playlist(guild_id, name, gq.current)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Added **{gq.current.title}** to **{name}**.")
+
+    @playlist_group.command(name="removetrack", description="Remove a track from a playlist by position")
+    @app_commands.describe(name="Playlist name", position="Track position (1-indexed)")
+    @app_commands.autocomplete(name=_playlist_name_autocomplete)
+    async def playlist_removetrack(
+        self, interaction: discord.Interaction, name: str, position: int
+    ) -> None:
+        guild_id = interaction.guild.id  # type: ignore[union-attr]
+        creator = self.playlists.get_creator(guild_id, name)
+        if creator is None:
+            await interaction.response.send_message(f"Playlist **{name}** not found.", ephemeral=True)
+            return
+        is_creator = creator == interaction.user.display_name
+        is_collab = self.playlists.is_collaborator(guild_id, name, interaction.user.id)
+        if not is_creator and not is_collab:
+            await interaction.response.send_message("You must be the creator or a collaborator.", ephemeral=True)
+            return
+        removed = self.playlists.remove_track_from_playlist(guild_id, name, position - 1)
+        if removed is None:
+            await interaction.response.send_message("Invalid position.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Removed **{removed['title']}** from **{name}**.")
+
+    # ── equalizer ────────────────────────────────────────────────────────
+
+    @app_commands.command(name="eq", description="Apply an EQ preset")
+    @app_commands.describe(preset="Equalizer preset to apply")
+    @app_commands.choices(preset=[
+        app_commands.Choice(name="Flat", value="flat"),
+        app_commands.Choice(name="Bass Heavy", value="bass_heavy"),
+        app_commands.Choice(name="Treble Heavy", value="treble_heavy"),
+        app_commands.Choice(name="Vocal", value="vocal"),
+        app_commands.Choice(name="Electronic", value="electronic"),
+    ])
+    async def eq(self, interaction: discord.Interaction, preset: str) -> None:
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        if err := _check_dj(interaction, gq):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        vc: Optional[discord.VoiceClient] = interaction.guild.voice_client  # type: ignore[union-attr, assignment]
+        if vc is None or not vc.is_playing():
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return
+        gq.eq_bands = list(EQ_PRESETS[preset])
+        self.queues.save_settings()
+        await interaction.response.defer()
+        elapsed = self._get_elapsed(gq)
+        await self._restart_playback(interaction.guild, seek_seconds=elapsed)  # type: ignore[arg-type]
+        await interaction.followup.send(f"EQ preset: **{preset.replace('_', ' ').title()}**.")
+
+    @app_commands.command(name="eqcustom", description="Set an individual EQ band gain")
+    @app_commands.describe(band="Band number (1-10)", gain="Gain in dB (-12 to +12)")
+    async def eqcustom(self, interaction: discord.Interaction, band: int, gain: float) -> None:
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        if err := _check_dj(interaction, gq):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        if not 1 <= band <= 10:
+            await interaction.response.send_message("Band must be 1-10.", ephemeral=True)
+            return
+        if not -12.0 <= gain <= 12.0:
+            await interaction.response.send_message("Gain must be -12 to +12 dB.", ephemeral=True)
+            return
+        vc: Optional[discord.VoiceClient] = interaction.guild.voice_client  # type: ignore[union-attr, assignment]
+        if vc is None or not vc.is_playing():
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return
+        gq.eq_bands[band - 1] = gain
+        self.queues.save_settings()
+        await interaction.response.defer()
+        elapsed = self._get_elapsed(gq)
+        await self._restart_playback(interaction.guild, seek_seconds=elapsed)  # type: ignore[arg-type]
+        from music.audio_source import EQ_BANDS
+        band_name = EQ_BANDS[band - 1][0]
+        await interaction.followup.send(f"EQ band {band} ({band_name}): **{gain:+.1f} dB**.")
+
+    # ── similar / radio ──────────────────────────────────────────────────
+
+    @app_commands.command(name="similar", description="Show tracks similar to the current one")
+    async def similar(self, interaction: discord.Interaction) -> None:
+        if not self.spotify.available:
+            await interaction.response.send_message("Requires Spotify credentials.", ephemeral=True)
+            return
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        if gq.current is None:
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        results = await self.bot.loop.run_in_executor(
+            None, lambda: self.spotify.recommend_multiple(gq.current.title, 5)  # type: ignore[union-attr]
+        )
+        if not results:
+            await interaction.followup.send("No similar tracks found.")
+            return
+        lines = [
+            f"**{i + 1}.** {t.title} [{format_duration(t.duration)}]"
+            for i, t in enumerate(results)
+        ]
+        embed = discord.Embed(
+            title=f"Similar to: {gq.current.title}",
+            description="\n".join(lines),
+            color=discord.Color.green(),
+        )
+        view = SearchView(results, self, interaction)
+        await interaction.followup.send(embed=embed, view=view)
+
+    @app_commands.command(name="radio", description="Start continuous radio seeded by artist or genre")
+    @app_commands.describe(seed="Artist name or genre to seed the radio")
+    async def radio(self, interaction: discord.Interaction, seed: str) -> None:
+        if not self.spotify.available:
+            await interaction.response.send_message("Requires Spotify credentials.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        gq.text_channel_id = interaction.channel_id
+
+        results = await self.bot.loop.run_in_executor(
+            None, lambda: self.spotify.recommend_by_seed(seed, set(), 5)
+        )
+        if not results:
+            await interaction.followup.send(f"No tracks found for **{seed}**.")
+            return
+
+        vc = await self._ensure_voice(interaction)
+        if vc is None:
+            return
+
+        gq.radio_mode = True
+        gq.radio_seed = seed
+        gq.radio_history = {tid for tid, _ in results}
+
+        count = 0
+        for _, track in results:
+            track.requester = "Radio"
+            track.requester_id = interaction.user.id
+            if gq.add(track) is None:
+                break
+            count += 1
+
+        if not vc.is_playing() and not vc.is_paused():
+            await self._play_next(interaction.guild)  # type: ignore[arg-type]
+
+        await interaction.followup.send(
+            f"Radio started with **{seed}** — queued {count} tracks. "
+            f"More will be added automatically."
+        )
+
+    @app_commands.command(name="radio-off", description="Stop radio mode")
+    async def radio_off(self, interaction: discord.Interaction) -> None:
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        if not gq.radio_mode:
+            await interaction.response.send_message("Radio mode is not active.", ephemeral=True)
+            return
+        gq.radio_mode = False
+        gq.radio_seed = None
+        gq.radio_history.clear()
+        await interaction.response.send_message("Radio mode stopped.")
+
+    # ── queue import/export ──────────────────────────────────────────────
+
+    @app_commands.command(name="queue-export", description="Export the queue as a shareable code")
+    async def queue_export(self, interaction: discord.Interaction) -> None:
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        tracks: list[dict] = []
+        if gq.current:
+            tracks.append({"t": gq.current.title, "u": gq.current.url, "d": gq.current.duration})
+        for t in gq.queue:
+            tracks.append({"t": t.title, "u": t.url, "d": t.duration})
+        if not tracks:
+            await interaction.response.send_message("Nothing to export.", ephemeral=True)
+            return
+        data = base64.b64encode(json.dumps(tracks, separators=(",", ":")).encode()).decode()
+        if len(data) <= 1900:
+            await interaction.response.send_message(f"```\n{data}\n```")
+        else:
+            import io
+            file = discord.File(io.BytesIO(data.encode()), filename="queue.txt")
+            await interaction.response.send_message("Queue exported:", file=file)
+
+    @app_commands.command(name="queue-import", description="Import a queue from an exported code")
+    @app_commands.describe(code="The exported queue code")
+    async def queue_import(self, interaction: discord.Interaction, code: str) -> None:
+        try:
+            raw = base64.b64decode(code.strip().strip("`")).decode()
+            items = json.loads(raw)
+        except Exception:
+            await interaction.response.send_message("Invalid queue code.", ephemeral=True)
+            return
+        if not isinstance(items, list) or not items:
+            await interaction.response.send_message("No tracks in the code.", ephemeral=True)
+            return
+
+        vc = await self._ensure_voice(interaction)
+        if vc is None:
+            return
+
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        gq.text_channel_id = interaction.channel_id
+        count = 0
+        for item in items:
+            track = TrackInfo(
+                title=item.get("t", "Unknown"),
+                url=item.get("u", ""),
+                duration=item.get("d", 0),
+                requester=interaction.user.display_name,
+                requester_id=interaction.user.id,
+            )
+            if gq.add(track) is None:
+                break
+            count += 1
+
+        self.queues.save_queue_state(interaction.guild.id)  # type: ignore[union-attr]
+        if not vc.is_playing() and not vc.is_paused():
+            await self._play_next(interaction.guild)  # type: ignore[arg-type]
+
+        msg = f"Imported **{count}** track{'s' if count != 1 else ''}."
+        if count < len(items):
+            msg += f" ({len(items) - count} skipped — queue full)"
+        if interaction.response.is_done():
+            await interaction.followup.send(msg)
+        else:
+            await interaction.response.send_message(msg)
+
+    # ── ratings ──────────────────────────────────────────────────────────
+
+    @app_commands.command(name="rate", description="Rate the current track (thumbs up/down)")
+    async def rate(self, interaction: discord.Interaction) -> None:
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        if gq.current is None:
+            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+            return
+        view = RateView(self, interaction.guild.id, gq.current.url, gq.current.title)  # type: ignore[union-attr]
+        embed = discord.Embed(
+            title="Rate this track",
+            description=f"**{gq.current.title}**",
+            color=discord.Color.gold(),
+        )
+        await interaction.response.send_message(embed=embed, view=view)
+
+    @app_commands.command(name="toprated", description="Show the top-rated tracks in this server")
+    async def toprated(self, interaction: discord.Interaction) -> None:
+        items = self.ratings.top_rated(interaction.guild.id)  # type: ignore[union-attr]
+        if not items:
+            await interaction.response.send_message("No ratings yet.", ephemeral=True)
+            return
+        lines = [
+            f"`{i + 1}.` **{title}** — \U0001f44d {up} \U0001f44e {down} (net: {up - down:+d})"
+            for i, (title, _url, up, down) in enumerate(items)
+        ]
+        embed = discord.Embed(
+            title="Top Rated Tracks",
+            description="\n".join(lines),
+            color=discord.Color.gold(),
+        )
+        await interaction.response.send_message(embed=embed)
+
+    # ── listening stats ──────────────────────────────────────────────────
+
+    @app_commands.command(name="stats", description="Show server listening stats")
+    async def stats(self, interaction: discord.Interaction) -> None:
+        data = self.history.server_stats(interaction.guild.id)  # type: ignore[union-attr]
+        if data["total_plays"] == 0:
+            await interaction.response.send_message("No play history yet.", ephemeral=True)
+            return
+        hours = data["total_time_seconds"] / 3600
+        lines = [
+            f"**Total plays:** {data['total_plays']}",
+            f"**Unique tracks:** {data['unique_tracks']}",
+            f"**Total listening time:** {hours:.1f} hours",
+        ]
+        if data["top_tracks"]:
+            lines.append("\n**Top Tracks:**")
+            for i, (title, count) in enumerate(data["top_tracks"][:5]):
+                lines.append(f"`{i + 1}.` {title} — {count} plays")
+        if data["top_users"]:
+            lines.append("\n**Top Listeners:**")
+            for i, (uid, count) in enumerate(data["top_users"][:5]):
+                member = interaction.guild.get_member(uid)  # type: ignore[union-attr]
+                name = member.display_name if member else f"User {uid}"
+                lines.append(f"`{i + 1}.` {name} — {count} plays")
+        embed = discord.Embed(
+            title=f"Server Stats — {interaction.guild.name}",  # type: ignore[union-attr]
+            description="\n".join(lines),
+            color=discord.Color.blue(),
+        )
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="mystats", description="Show your personal listening stats")
+    async def mystats(self, interaction: discord.Interaction) -> None:
+        data = self.history.user_stats(interaction.guild.id, interaction.user.id)  # type: ignore[union-attr]
+        if data["total_plays"] == 0:
+            await interaction.response.send_message("No listening history for you yet.", ephemeral=True)
+            return
+        hours = data["total_time_seconds"] / 3600
+        lines = [
+            f"**Total plays:** {data['total_plays']}",
+            f"**Total listening time:** {hours:.1f} hours",
+        ]
+        if data["top_tracks"]:
+            lines.append("\n**Your Top Tracks:**")
+            for i, (title, count) in enumerate(data["top_tracks"][:5]):
+                lines.append(f"`{i + 1}.` {title} — {count} plays")
+        embed = discord.Embed(
+            title=f"Your Stats — {interaction.user.display_name}",
+            description="\n".join(lines),
+            color=discord.Color.purple(),
+        )
+        await interaction.response.send_message(embed=embed)
+
+    # ── DJ queue mode ────────────────────────────────────────────────────
+
+    @app_commands.command(name="djmode", description="Toggle DJ approval queue mode (admin only)")
+    async def djmode(self, interaction: discord.Interaction) -> None:
+        if not interaction.user.guild_permissions.administrator:  # type: ignore[union-attr]
+            await interaction.response.send_message("Only admins can toggle DJ mode.", ephemeral=True)
+            return
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        gq.dj_queue_mode = not gq.dj_queue_mode
+        state = "on" if gq.dj_queue_mode else "off"
+        await interaction.response.send_message(
+            f"DJ queue mode is now **{state}**. "
+            + ("Non-DJs must get approval to add tracks." if gq.dj_queue_mode else "")
+        )
+
+    # ── undo ─────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="undo", description="Undo the last queue mutation")
+    async def undo(self, interaction: discord.Interaction) -> None:
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        desc = gq.undo()
+        if desc is None:
+            await interaction.response.send_message("Nothing to undo.", ephemeral=True)
+            return
+        self.queues.save_queue_state(interaction.guild.id)  # type: ignore[union-attr]
+        await interaction.response.send_message(f"Undone: **{desc}**. Queue restored.")
+
+    # ── language ──────────────────────────────────────────────────────────
+
+    @app_commands.command(name="language", description="Set the bot language for this server")
+    @app_commands.describe(lang="Language code (e.g. en, tr, de)")
+    async def language(self, interaction: discord.Interaction, lang: str) -> None:
+        from music.i18n import available_locales
+        available = available_locales()
+        if lang not in available:
+            await interaction.response.send_message(
+                f"Language **{lang}** is not available. Available: {', '.join(available) or 'en'}",
+                ephemeral=True,
+            )
+            return
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        gq.locale = lang
+        self.queues.save_settings()
+        await interaction.response.send_message(f"Language set to **{lang}**.")
+
+    # ── crossfade ────────────────────────────────────────────────────────
+
+    @app_commands.command(name="crossfade", description="Set crossfade duration between tracks (0-10 seconds)")
+    @app_commands.describe(seconds="Crossfade duration in seconds (0 to disable)")
+    async def crossfade(self, interaction: discord.Interaction, seconds: int) -> None:
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        if err := _check_dj(interaction, gq):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        if not 0 <= seconds <= 10:
+            await interaction.response.send_message("Must be 0-10 seconds.", ephemeral=True)
+            return
+        gq.crossfade_seconds = seconds
+        self.queues.save_settings()
+        if seconds == 0:
+            self._cancel_crossfade_timer(interaction.guild.id)  # type: ignore[union-attr]
+            await interaction.response.send_message("Crossfade disabled.")
+        else:
+            await interaction.response.send_message(f"Crossfade set to **{seconds}s**.")
+
     @commands.Cog.listener()
     async def on_voice_state_update(
         self,
@@ -1822,19 +2573,45 @@ class MusicCog(commands.Cog):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        """Auto-disconnect when the bot is left alone in a voice channel."""
+        """Auto-disconnect when alone + join notification."""
         if member.bot:
             return
 
-        # Only care about someone leaving the bot's channel
+        vc: Optional[discord.VoiceClient] = member.guild.voice_client  # type: ignore[assignment]
+        if vc is None:
+            return
+
+        # Join notification: user joined the bot's VC
+        if (
+            after.channel is not None
+            and after.channel == vc.channel
+            and (before.channel is None or before.channel != after.channel)
+        ):
+            gq = self.queues.get(member.guild.id)
+            if gq.current and gq.text_channel_id and vc.is_playing():
+                channel = member.guild.get_channel(gq.text_channel_id)
+                if channel and hasattr(channel, "send"):
+                    track = gq.current
+                    elapsed = self._get_elapsed(gq)
+                    embed = discord.Embed(
+                        title="Now Playing",
+                        description=f"**{track.title}**\n{progress_bar(elapsed, track.duration)}",
+                        color=discord.Color.green(),
+                    )
+                    if track.thumbnail:
+                        embed.set_thumbnail(url=track.thumbnail)
+                    try:
+                        await channel.send(embed=embed, delete_after=30)  # type: ignore[union-attr]
+                    except discord.HTTPException:
+                        pass
+
+        # Auto-disconnect when bot is left alone
         if before.channel is None:
             return
 
-        vc: Optional[discord.VoiceClient] = member.guild.voice_client  # type: ignore[assignment]
-        if vc is None or vc.channel != before.channel:
+        if vc.channel != before.channel:
             return
 
-        # Check if bot is the only one left
         non_bot_members = [m for m in before.channel.members if not m.bot]
         if len(non_bot_members) == 0:
             gq = self.queues.get(member.guild.id)
@@ -1842,8 +2619,11 @@ class MusicCog(commands.Cog):
                 return
             gq.clear()
             self.queues.clear_queue_state(member.guild.id)
+            self._cancel_crossfade_timer(member.guild.id)
             vc.stop()
             await vc.disconnect()
+            metric_voice_connections.dec()
+            metric_active_players.dec()
             self.queues.remove(member.guild.id)
             await self._update_presence(None)
 

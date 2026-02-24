@@ -10,6 +10,7 @@ class InputType(Enum):
     SPOTIFY_ALBUM = auto()
     SOUNDCLOUD_URL = auto()
     SOUNDCLOUD_PLAYLIST = auto()
+    RADIO_STREAM = auto()
     SEARCH_QUERY = auto()
 
 
@@ -24,6 +25,10 @@ _SPOTIFY_RE = re.compile(
 _SOUNDCLOUD_RE = re.compile(
     r"(?:https?://)?(?:www\.)?soundcloud\.com/[^/]+/\S+"
 )
+
+_STREAM_RE = re.compile(
+    r"(?:https?://)\S+\.(?:m3u8?|pls|aac|mp3|ogg|opus)(?:\?\S*)?"
+    r"|(?:https?://)\S+(?:/stream|/live|/radio)\S*", re.IGNORECASE)
 
 
 def classify(query: str) -> tuple[InputType, str]:
@@ -49,6 +54,10 @@ def classify(query: str) -> tuple[InputType, str]:
         if "/sets/" in query:
             return InputType.SOUNDCLOUD_PLAYLIST, query
         return InputType.SOUNDCLOUD_URL, query
+
+    # Check for radio/live streams before YouTube (some streams may have youtube-like domains)
+    if _STREAM_RE.match(query):
+        return InputType.RADIO_STREAM, query
 
     if _YOUTUBE_RE.match(query):
         if "list=" in query:
