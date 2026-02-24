@@ -265,7 +265,11 @@ class MusicCog(commands.Cog):
             for entry in entries:
                 if entry is None:
                     continue
-                url = entry.get("webpage_url") or entry.get("url", "")
+                video_id = entry.get("id", "")
+                if video_id:
+                    url = f"https://www.youtube.com/watch?v={video_id}"
+                else:
+                    url = entry.get("webpage_url") or entry.get("url", "")
                 track = TrackInfo(
                     title=entry.get("title", "Unknown"),
                     url=url,
