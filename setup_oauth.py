@@ -14,48 +14,54 @@ CLIENT_SECRET = "SboVhoG9s0rNafixCSGGKXAT"
 TOKEN_FILE = Path.home() / ".cache" / "yt-dlp" / "youtube-oauth2" / "token.json"
 
 
+def _post(url: str, params: dict) -> dict:
+    data = urllib.parse.urlencode(params).encode()
+    req = urllib.request.Request(url, data=data)
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
 def main() -> None:
-    data = urllib.parse.urlencode({
+    device = _post("https://oauth2.googleapis.com/device/code", {
         "client_id": CLIENT_ID,
         "scope": "http://gdata.youtube.com https://www.googleapis.com/auth/youtube",
-    }).encode()
-
-    req = urllib.request.Request("https://oauth2.googleapis.com/device/code", data=data)
-    with urllib.request.urlopen(req) as resp:
-        device = json.loads(resp.read())
+    })
 
     print(f"\n  Go to:       {device['verification_url']}")
     print(f"  Enter code:  {device['user_code']}\n")
-    print("Waiting for authorization...")
+    print("Waiting for authorization (you have a few minutes)...")
 
     interval = device.get("interval", 5)
+    token_params = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "device_code": device["device_code"],
+        "grant_type": "urn:ietf:params:oauth:2.0:device_code",
+    }
+
     while True:
         time.sleep(interval)
-        data = urllib.parse.urlencode({
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "device_code": device["device_code"],
-            "grant_type": "urn:ietf:params:oauth:2.0:device_code",
-        }).encode()
-
+        data = urllib.parse.urlencode(token_params).encode()
         req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data)
         try:
             with urllib.request.urlopen(req) as resp:
                 token = json.loads(resp.read())
+                break
         except urllib.error.HTTPError as e:
-            error = json.loads(e.read()).get("error")
+            body = json.loads(e.read())
+            error = body.get("error", "")
             if error == "authorization_pending":
+                print("  ...still waiting")
                 continue
             if error == "slow_down":
                 interval += 2
                 continue
+            print(f"  Error from Google: {body}")
             raise
-
-        break
 
     TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
     TOKEN_FILE.write_text(json.dumps(token))
-    print("Authorized! Token saved. You can now start the bot.")
+    print(f"\nAuthorized! Token saved to {TOKEN_FILE}")
 
 
 if __name__ == "__main__":
