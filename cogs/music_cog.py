@@ -340,15 +340,45 @@ class PlayerView(discord.ui.View):
         if not gq.current or gq.current.duration <= 0:
             return
         dur = gq.current.duration
+
+        # Pick an interval that gives 15-25 options (Discord max is 25)
+        if dur <= 120:        # <=2m  → every 10s
+            step = 10
+        elif dur <= 300:     # <=5m  → every 15s
+            step = 15
+        elif dur <= 600:     # <=10m → every 30s
+            step = 30
+        elif dur <= 1800:    # <=30m → every 60s
+            step = 60
+        elif dur <= 3600:    # <=1h  → every 2m
+            step = 120
+        elif dur <= 7200:    # <=2h  → every 5m
+            step = 300
+        else:                # >2h   → every 10m
+            step = 600
+
         options: list[discord.SelectOption] = []
-        for pct in range(0, 100, 10):
-            secs = int(dur * pct / 100)
+        t = 0
+        while t < dur and len(options) < 25:
+            pct = int(t / dur * 100)
+            bar_len = 10
+            filled = round(bar_len * t / dur)
+            bar = "\u25ac" * filled + "\U0001f518" + "\u25ac" * (bar_len - filled)
             options.append(discord.SelectOption(
-                label=format_duration(secs),
-                value=str(secs),
-                description=f"{pct}% of track",
+                label=f"{format_duration(t)}  /  {format_duration(dur)}",
+                value=str(t),
+                description=f"{bar}  ({pct}%)",
             ))
-        select = discord.ui.Select(placeholder="Jump to...", options=options, row=1)
+            t += step
+
+        if not options:
+            return
+
+        select = discord.ui.Select(
+            placeholder=f"\u23e9  Seek  \u2014  {format_duration(dur)}",
+            options=options,
+            row=1,
+        )
         select.callback = self._on_seek
         self.add_item(select)
 
@@ -384,7 +414,8 @@ class PlayerView(discord.ui.View):
 
         url = track.url if track.url and not track.url.startswith("ytsearch:") else None
         embed = discord.Embed(title=track.title, url=url, color=discord.Color.blurple())
-        embed.description = f"\n{progress_bar(elapsed, track.duration)}\n"
+        bar = progress_bar(elapsed, track.duration)
+        embed.description = f"\n{bar}\n\u2193 *Use the dropdown to seek* \u2193" if track.duration > 0 else f"\n{bar}\n"
 
         if track.thumbnail:
             embed.set_thumbnail(url=track.thumbnail)
