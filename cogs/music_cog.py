@@ -101,6 +101,12 @@ class MusicCog(commands.Cog):
 
         return vc
 
+    def _check_idle(self, guild: discord.Guild) -> None:
+        vc: Optional[discord.VoiceClient] = guild.voice_client  # type: ignore[assignment]
+        if vc and not vc.is_playing() and not vc.is_paused():
+            asyncio.run_coroutine_threadsafe(vc.disconnect(), self.bot.loop)
+            self.queues.remove(guild.id)
+
     def _after_play(self, guild: discord.Guild, error: Exception | None) -> None:
         if error:
             log.error("Playback error in guild %s: %s", guild.id, error)
@@ -115,6 +121,7 @@ class MusicCog(commands.Cog):
 
         track = gq.next_track()
         if track is None:
+            self.bot.loop.call_later(300, self._check_idle, guild)
             return
 
         try:
