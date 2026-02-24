@@ -10,7 +10,7 @@ import yt_dlp
 log = logging.getLogger(__name__)
 
 YTDL_OPTIONS = {
-    "format": "bestaudio/best",
+    "format": "bestaudio[acodec=opus]/bestaudio/best",
     "noplaylist": True,
     "nocheckcertificate": True,
     "ignoreerrors": False,
