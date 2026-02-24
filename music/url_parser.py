@@ -8,6 +8,8 @@ class InputType(Enum):
     SPOTIFY_TRACK = auto()
     SPOTIFY_PLAYLIST = auto()
     SPOTIFY_ALBUM = auto()
+    SOUNDCLOUD_URL = auto()
+    SOUNDCLOUD_PLAYLIST = auto()
     SEARCH_QUERY = auto()
 
 
@@ -17,6 +19,10 @@ _YOUTUBE_RE = re.compile(
 
 _SPOTIFY_RE = re.compile(
     r"(?:https?://)?open\.spotify\.com/(track|playlist|album)/([A-Za-z0-9]+)"
+)
+
+_SOUNDCLOUD_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?soundcloud\.com/[^/]+/\S+"
 )
 
 
@@ -38,6 +44,11 @@ def classify(query: str) -> tuple[InputType, str]:
             "album": InputType.SPOTIFY_ALBUM,
         }
         return type_map[kind], spotify_id
+
+    if _SOUNDCLOUD_RE.match(query):
+        if "/sets/" in query:
+            return InputType.SOUNDCLOUD_PLAYLIST, query
+        return InputType.SOUNDCLOUD_URL, query
 
     if _YOUTUBE_RE.match(query):
         if "list=" in query:

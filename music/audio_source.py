@@ -32,6 +32,7 @@ AUDIO_FILTERS: dict[str, str] = {
     "nightcore": "aresample=48000,asetrate=48000*1.25",
     "vaporwave": "aresample=48000,asetrate=48000*0.8",
     "8d": "apulsator=hz=0.08",
+    "karaoke": "pan=stereo|c0=c0-c1|c1=c1-c0",
 }
 
 
@@ -74,6 +75,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
         volume: float = 0.5,
         filter_name: str | None = None,
         seek_seconds: int = 0,
+        speed: float = 1.0,
+        normalize: bool = False,
     ) -> YTDLSource:
         """Create a playable source from a URL or search query."""
         ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
@@ -86,7 +89,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
         url = data["url"]
         return cls._build(url, data=data, volume=volume,
-                          filter_name=filter_name, seek_seconds=seek_seconds)
+                          filter_name=filter_name, seek_seconds=seek_seconds,
+                          speed=speed, normalize=normalize)
 
     @classmethod
     def from_stream_url(
@@ -97,10 +101,13 @@ class YTDLSource(discord.PCMVolumeTransformer):
         volume: float = 0.5,
         filter_name: str | None = None,
         seek_seconds: int = 0,
+        speed: float = 1.0,
+        normalize: bool = False,
     ) -> YTDLSource:
         """Rebuild an FFmpeg source from a cached stream URL (no yt-dlp fetch)."""
         return cls._build(stream_url, data=data, volume=volume,
-                          filter_name=filter_name, seek_seconds=seek_seconds)
+                          filter_name=filter_name, seek_seconds=seek_seconds,
+                          speed=speed, normalize=normalize)
 
     @classmethod
     def _build(
@@ -111,6 +118,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
         volume: float,
         filter_name: str | None,
         seek_seconds: int,
+        speed: float = 1.0,
+        normalize: bool = False,
     ) -> YTDLSource:
         before = FFMPEG_OPTIONS["before_options"]
         opts = FFMPEG_OPTIONS["options"]
@@ -118,8 +127,15 @@ class YTDLSource(discord.PCMVolumeTransformer):
         if seek_seconds > 0:
             before = f"-ss {seek_seconds} " + before
 
+        af_parts: list[str] = []
         if filter_name and filter_name in AUDIO_FILTERS:
-            opts = opts + f" -af {AUDIO_FILTERS[filter_name]}"
+            af_parts.append(AUDIO_FILTERS[filter_name])
+        if speed != 1.0:
+            af_parts.append(f"atempo={speed}")
+        if normalize:
+            af_parts.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+        if af_parts:
+            opts = opts + " -af " + ",".join(af_parts)
 
         source = discord.FFmpegPCMAudio(
             stream_url, before_options=before, options=opts
