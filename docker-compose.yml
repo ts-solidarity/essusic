@@ -3,3 +3,8 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+    volumes:
+      - ytdl-cache:/root/.cache/yt-dlp
+
+volumes:
+  ytdl-cache:
