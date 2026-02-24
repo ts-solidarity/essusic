@@ -2582,14 +2582,20 @@ class MusicCog(commands.Cog):
             return
 
         # Join notification: user joined the bot's VC
-        if (
+        joined_bot_vc = (
             after.channel is not None
             and after.channel == vc.channel
             and (before.channel is None or before.channel != after.channel)
-        ):
+        )
+        if joined_bot_vc:
             gq = self.queues.get(member.guild.id)
+            log.info(
+                "VC join: %s | current=%s text_ch=%s playing=%s",
+                member, gq.current is not None, gq.text_channel_id, vc.is_playing(),
+            )
             if gq.current and gq.text_channel_id and vc.is_playing():
                 channel = member.guild.get_channel(gq.text_channel_id)
+                log.info("Sending join notification to channel %s (resolved: %s)", gq.text_channel_id, channel)
                 if channel and hasattr(channel, "send"):
                     track = gq.current
                     elapsed = self._get_elapsed(gq)
@@ -2602,8 +2608,8 @@ class MusicCog(commands.Cog):
                         embed.set_thumbnail(url=track.thumbnail)
                     try:
                         await channel.send(embed=embed, delete_after=30)  # type: ignore[union-attr]
-                    except discord.HTTPException:
-                        pass
+                    except discord.HTTPException as exc:
+                        log.warning("Join notification failed: %s", exc)
 
         # Auto-disconnect when bot is left alone
         if before.channel is None:
