@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOST="${1:?Usage: ./deploy.sh user@host}"
+HOST="${1:?Usage: ./deploy.sh user@host [browser]}"
+BROWSER="${2:-brave}"
 REMOTE_DIR="/opt/essusic"
 
-echo "==> Exporting cookies from Brave..."
-yt-dlp --cookies-from-browser brave --cookies /tmp/essusic-cookies.txt \
+echo "==> Exporting cookies from ${BROWSER}..."
+yt-dlp --cookies-from-browser "$BROWSER" --cookies /tmp/essusic-cookies.txt \
     "https://www.youtube.com/watch?v=dQw4w9WgXcQ" --skip-download --quiet
 
 echo "==> Pushing latest code..."
