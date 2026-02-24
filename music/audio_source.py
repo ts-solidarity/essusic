@@ -73,7 +73,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
         query: str, *, loop: asyncio.AbstractEventLoop, limit: int = 5
     ) -> list[TrackInfo]:
         """Search YouTube and return lightweight TrackInfo results."""
-        opts = {**YTDL_OPTIONS, "noplaylist": True}
+        opts = {**YTDL_OPTIONS, "noplaylist": True, "extract_flat": "in_playlist"}
         ytdl = yt_dlp.YoutubeDL(opts)
 
         search_query = f"ytsearch{limit}:{query}"
