@@ -221,18 +221,9 @@ class MusicCog(commands.Cog):
         try:
             # Peek at metadata to get title, then queue lightweight TrackInfo
             import yt_dlp
+            from music.audio_source import YTDL_OPTIONS
 
-            ytdl = yt_dlp.YoutubeDL(
-                {
-                    "format": "bestaudio/best",
-                    "noplaylist": True,
-                    "quiet": True,
-                    "no_warnings": True,
-                    "default_search": "ytsearch",
-                    "source_address": "0.0.0.0",
-                    "skip_download": True,
-                }
-            )
+            ytdl = yt_dlp.YoutubeDL({**YTDL_OPTIONS, "skip_download": True})
             data = await self.bot.loop.run_in_executor(
                 None, lambda: ytdl.extract_info(url, download=False)
             )
