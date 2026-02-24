@@ -799,11 +799,41 @@ class MusicCog(commands.Cog):
             )
             self._crossfade_timers[guild.id] = handle
 
-        # Auto-refresh active player view
-        pv = self._active_players.get(guild.id)
-        if pv and not pv.is_finished():
-            pv._build_seek_menu_safe()
-            asyncio.ensure_future(pv._refresh())
+        # Auto-send/refresh the player view in the text channel
+        await self._send_player(guild, gq)
+
+    async def _send_player(self, guild: discord.Guild, gq: GuildQueue) -> None:
+        """Send or refresh the interactive PlayerView in the text channel."""
+        # Clean up the old player
+        old = self._active_players.pop(guild.id, None)
+        if old:
+            if old._update_task and not old._update_task.done():
+                old._update_task.cancel()
+            old.stop()
+            # Delete old message to avoid clutter
+            if old.message:
+                try:
+                    await old.message.delete()
+                except discord.HTTPException:
+                    pass
+
+        if gq.current is None or gq.text_channel_id is None:
+            return
+
+        channel = guild.get_channel(gq.text_channel_id)
+        if channel is None or not hasattr(channel, "send"):
+            return
+
+        view = PlayerView(self, guild)
+        self._active_players[guild.id] = view
+        embed = view._build_embed()
+        view._sync_pause_button()
+        try:
+            msg = await channel.send(embed=embed, view=view)  # type: ignore[union-attr]
+            view.message = msg
+            view._update_task = asyncio.create_task(view._auto_update())
+        except discord.HTTPException:
+            self._active_players.pop(guild.id, None)
 
     async def _update_presence(self, track: TrackInfo | None) -> None:
         if track:
@@ -1343,22 +1373,10 @@ class MusicCog(commands.Cog):
         if gq.current is None:
             await interaction.response.send_message("Nothing is playing.", ephemeral=True)
             return
-
-        # Clean up old player for this guild
-        old = self._active_players.pop(interaction.guild.id, None)  # type: ignore[union-attr]
-        if old:
-            if old._update_task and not old._update_task.done():
-                old._update_task.cancel()
-            old.stop()
-
-        view = PlayerView(self, interaction.guild)  # type: ignore[arg-type]
-        self._active_players[interaction.guild.id] = view  # type: ignore[union-attr]
-
-        embed = view._build_embed()
-        view._sync_pause_button()
-        await interaction.response.send_message(embed=embed, view=view)
-        view.message = await interaction.original_response()
-        view._update_task = asyncio.create_task(view._auto_update())
+        gq.text_channel_id = interaction.channel_id
+        await interaction.response.defer()
+        await self._send_player(interaction.guild, gq)  # type: ignore[arg-type]
+        await interaction.followup.send("Player opened.", ephemeral=True)
 
     @app_commands.command(name="volume", description="Adjust volume (1-100)")
     @app_commands.describe(level="Volume level from 1 to 100")
@@ -2589,13 +2607,8 @@ class MusicCog(commands.Cog):
         )
         if joined_bot_vc:
             gq = self.queues.get(member.guild.id)
-            log.info(
-                "VC join: %s | current=%s text_ch=%s playing=%s",
-                member, gq.current is not None, gq.text_channel_id, vc.is_playing(),
-            )
             if gq.current and gq.text_channel_id and vc.is_playing():
                 channel = member.guild.get_channel(gq.text_channel_id)
-                log.info("Sending join notification to channel %s (resolved: %s)", gq.text_channel_id, channel)
                 if channel and hasattr(channel, "send"):
                     track = gq.current
                     elapsed = self._get_elapsed(gq)
@@ -2608,8 +2621,8 @@ class MusicCog(commands.Cog):
                         embed.set_thumbnail(url=track.thumbnail)
                     try:
                         await channel.send(embed=embed, delete_after=30)  # type: ignore[union-attr]
-                    except discord.HTTPException as exc:
-                        log.warning("Join notification failed: %s", exc)
+                    except discord.HTTPException:
+                        pass
 
         # Auto-disconnect when bot is left alone
         if before.channel is None:
