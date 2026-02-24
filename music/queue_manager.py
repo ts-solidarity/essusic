@@ -33,6 +33,7 @@ class GuildQueue:
         self.current: TrackInfo | None = None
         self.loop_mode: LoopMode = LoopMode.OFF
         self.volume: float = 0.5
+        self.search_mode: str = "youtube"
 
     def add(self, track: TrackInfo) -> int:
         """Add a track and return its position (1-indexed)."""

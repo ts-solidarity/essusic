@@ -6,6 +6,8 @@ import os
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
 
+from .audio_source import TrackInfo
+
 log = logging.getLogger(__name__)
 
 
@@ -32,6 +34,25 @@ class SpotifyResolver:
     def _format_track(self, track: dict) -> str:
         artists = ", ".join(a["name"] for a in track["artists"])
         return f"{artists} - {track['name']}"
+
+    def search(self, query: str, limit: int = 5) -> list[TrackInfo]:
+        """Search Spotify for tracks and return TrackInfo results."""
+        if not self._sp:
+            return []
+        results = self._sp.search(q=query, type="track", limit=limit)
+        tracks: list[TrackInfo] = []
+        for item in results.get("tracks", {}).get("items", []):
+            artist_names = ", ".join(a["name"] for a in item["artists"])
+            title = f"{artist_names} - {item['name']}"
+            duration_ms = item.get("duration_ms", 0)
+            tracks.append(
+                TrackInfo(
+                    title=title,
+                    url=f"ytsearch:{title}",
+                    duration=duration_ms // 1000,
+                )
+            )
+        return tracks
 
     def resolve_track(self, track_id: str) -> list[str]:
         if not self._sp:

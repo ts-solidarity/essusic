@@ -369,11 +369,7 @@ class MusicCog(commands.Cog):
 
         await interaction.response.send_message(f"Volume set to **{level}%**.")
 
-    @app_commands.command(name="search", description="Search YouTube and pick from results")
-    @app_commands.describe(query="Search keywords")
-    async def search(self, interaction: discord.Interaction, query: str) -> None:
-        await interaction.response.defer()
-
+    async def _do_youtube_search(self, interaction: discord.Interaction, query: str) -> None:
         results = await YTDLSource.search(query, loop=self.bot.loop, limit=5)
         if not results:
             await interaction.followup.send("No results found.")
@@ -384,13 +380,71 @@ class MusicCog(commands.Cog):
             for i, t in enumerate(results)
         ]
         embed = discord.Embed(
-            title=f"Search results for: {query}",
+            title=f"YouTube results for: {query}",
             description="\n".join(lines),
             color=discord.Color.orange(),
         )
-
         view = SearchView(results, self, interaction)
         await interaction.followup.send(embed=embed, view=view)
+
+    async def _do_spotify_search(self, interaction: discord.Interaction, query: str) -> None:
+        if not self.spotify.available:
+            await interaction.followup.send(
+                "Spotify credentials are not configured.", ephemeral=True
+            )
+            return
+
+        results = await self.bot.loop.run_in_executor(
+            None, lambda: self.spotify.search(query, limit=5)
+        )
+        if not results:
+            await interaction.followup.send("No results found.")
+            return
+
+        lines = [
+            f"**{i + 1}.** {t.title} [{format_duration(t.duration)}]"
+            for i, t in enumerate(results)
+        ]
+        embed = discord.Embed(
+            title=f"Spotify results for: {query}",
+            description="\n".join(lines),
+            color=discord.Color.green(),
+        )
+        view = SearchView(results, self, interaction)
+        await interaction.followup.send(embed=embed, view=view)
+
+    @app_commands.command(name="search", description="Search and pick from results (uses server default)")
+    @app_commands.describe(query="Search keywords")
+    async def search(self, interaction: discord.Interaction, query: str) -> None:
+        await interaction.response.defer()
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        if gq.search_mode == "spotify":
+            await self._do_spotify_search(interaction, query)
+        else:
+            await self._do_youtube_search(interaction, query)
+
+    @app_commands.command(name="youtube-search", description="Search YouTube and pick from results")
+    @app_commands.describe(query="Search keywords")
+    async def youtube_search(self, interaction: discord.Interaction, query: str) -> None:
+        await interaction.response.defer()
+        await self._do_youtube_search(interaction, query)
+
+    @app_commands.command(name="spotify-search", description="Search Spotify and pick from results")
+    @app_commands.describe(query="Search keywords")
+    async def spotify_search(self, interaction: discord.Interaction, query: str) -> None:
+        await interaction.response.defer()
+        await self._do_spotify_search(interaction, query)
+
+    @app_commands.command(name="searchmode", description="Toggle default search between YouTube and Spotify")
+    async def searchmode(self, interaction: discord.Interaction) -> None:
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        if gq.search_mode == "youtube":
+            gq.search_mode = "spotify"
+        else:
+            gq.search_mode = "youtube"
+        await interaction.response.send_message(
+            f"Default search mode set to **{gq.search_mode}**."
+        )
 
     @app_commands.command(name="shuffle", description="Shuffle the queue")
     async def shuffle(self, interaction: discord.Interaction) -> None:
