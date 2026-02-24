@@ -19,6 +19,7 @@ YTDL_OPTIONS = {
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
     "cookiefile": "/data/cookies.txt",
+    "js_runtimes": "node",
 }
 
 FFMPEG_OPTIONS = {
