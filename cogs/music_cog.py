@@ -95,7 +95,7 @@ class MusicCog(commands.Cog):
         vc: Optional[discord.VoiceClient] = interaction.guild.voice_client  # type: ignore[assignment]
 
         if vc is None:
-            vc = await channel.connect(self_deaf=True, bitrate=96)
+            vc = await channel.connect(self_deaf=True)
         elif vc.channel != channel:
             await vc.move_to(channel)
 
