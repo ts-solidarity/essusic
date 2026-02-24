@@ -232,7 +232,12 @@ class MusicCog(commands.Cog):
                 from music.audio_source import YTDL_OPTIONS
 
                 ytdl = yt_dlp.YoutubeDL(
-                    {**YTDL_OPTIONS, "noplaylist": False, "extract_flat": "in_playlist"}
+                    {
+                        **YTDL_OPTIONS,
+                        "noplaylist": False,
+                        "extract_flat": "in_playlist",
+                        "extractor_args": {"youtubetab": {"skip": ["authcheck"]}},
+                    }
                 )
                 data = await self.bot.loop.run_in_executor(
                     None, lambda: ytdl.extract_info(value, download=False)
