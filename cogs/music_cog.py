@@ -46,6 +46,11 @@ class SearchView(discord.ui.View):
 
     def _make_callback(self, track: TrackInfo):
         async def callback(interaction: discord.Interaction) -> None:
+            await interaction.response.defer()
+            # Disable all buttons after selection
+            for item in self.children:
+                item.disabled = True  # type: ignore[union-attr]
+            await self.original_interaction.edit_original_response(view=self)
             track.requester = interaction.user.display_name
             await self.cog._enqueue_and_play(interaction, track)
             self.stop()
