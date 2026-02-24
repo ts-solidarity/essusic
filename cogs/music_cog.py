@@ -47,13 +47,20 @@ class SearchView(discord.ui.View):
     def _make_callback(self, track: TrackInfo):
         async def callback(interaction: discord.Interaction) -> None:
             await interaction.response.defer()
-            # Disable all buttons after selection
-            for item in self.children:
-                item.disabled = True  # type: ignore[union-attr]
-            await self.original_interaction.edit_original_response(view=self)
             track.requester = interaction.user.display_name
-            await self.cog._enqueue_and_play(interaction, track)
-            self.stop()
+
+            vc = await self.cog._ensure_voice(interaction)
+            if vc is None:
+                return
+
+            if vc.is_playing() or vc.is_paused():
+                gq = self.cog.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+                gq.current = None
+                gq.queue.appendleft(track)
+                vc.stop()  # triggers _play_next → pops our track from front
+                await interaction.followup.send(f"Now playing: **{track.title}**")
+            else:
+                await self.cog._enqueue_and_play(interaction, track)
 
         return callback
 
