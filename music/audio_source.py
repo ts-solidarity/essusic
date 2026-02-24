@@ -76,7 +76,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
         opts = {**YTDL_OPTIONS, "noplaylist": True, "extract_flat": "in_playlist"}
         ytdl = yt_dlp.YoutubeDL(opts)
 
-        search_query = f"ytsearch{limit}:{query}"
+        search_query = f"ytsearch{limit * 2}:{query}"
         data = await loop.run_in_executor(
             None, lambda: ytdl.extract_info(search_query, download=False)
         )
@@ -96,4 +96,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
                     thumbnail=entry.get("thumbnail", ""),
                 )
             )
+            if len(results) >= limit:
+                break
         return results
