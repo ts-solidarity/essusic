@@ -58,6 +58,23 @@ class GuildQueue:
         self.current = self.queue.popleft()
         return self.current
 
+    def remove_at(self, index: int) -> TrackInfo | None:
+        """Remove and return the track at 0-based index, or None if out of range."""
+        if index < 0 or index >= len(self.queue):
+            return None
+        items = list(self.queue)
+        removed = items.pop(index)
+        self.queue = deque(items)
+        return removed
+
+    def skip_to(self, index: int) -> TrackInfo | None:
+        """Drop all tracks before 0-based index and return the track at that position."""
+        if index < 0 or index >= len(self.queue):
+            return None
+        items = list(self.queue)
+        self.queue = deque(items[index:])
+        return self.queue[0]
+
     def shuffle(self) -> None:
         items = list(self.queue)
         random.shuffle(items)

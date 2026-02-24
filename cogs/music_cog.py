@@ -593,6 +593,48 @@ class MusicCog(commands.Cog):
         gq.max_queue = size
         await interaction.response.send_message(f"Max queue size set to **{size}**.")
 
+    @app_commands.command(name="remove", description="Remove a track from the queue")
+    @app_commands.describe(position="Position in the queue (1-indexed)")
+    async def remove(self, interaction: discord.Interaction, position: int) -> None:
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        removed = gq.remove_at(position - 1)
+        if removed is None:
+            await interaction.response.send_message(
+                f"Invalid position. Queue has {len(gq.queue)} tracks.", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(f"Removed **{removed.title}** from the queue.")
+
+    @app_commands.command(name="skipto", description="Skip to a specific position in the queue")
+    @app_commands.describe(position="Position in the queue to skip to (1-indexed)")
+    async def skipto(self, interaction: discord.Interaction, position: int) -> None:
+        vc: Optional[discord.VoiceClient] = interaction.guild.voice_client  # type: ignore[union-attr, assignment]
+        if vc is None:
+            await interaction.response.send_message("Not connected.", ephemeral=True)
+            return
+
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        target = gq.skip_to(position - 1)
+        if target is None:
+            await interaction.response.send_message(
+                f"Invalid position. Queue has {len(gq.queue)} tracks.", ephemeral=True
+            )
+            return
+
+        gq.current = None
+        vc.stop()  # triggers _play_next → pops target from front
+        await interaction.response.send_message(f"Skipping to **{target.title}**.")
+
+    @app_commands.command(name="clear", description="Clear the queue (keeps current track playing)")
+    async def clear(self, interaction: discord.Interaction) -> None:
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        count = len(gq.queue)
+        if count == 0:
+            await interaction.response.send_message("Queue is already empty.", ephemeral=True)
+            return
+        gq.queue.clear()
+        await interaction.response.send_message(f"Cleared **{count}** tracks from the queue.")
+
     @app_commands.command(name="shuffle", description="Shuffle the queue")
     async def shuffle(self, interaction: discord.Interaction) -> None:
         gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
@@ -609,6 +651,35 @@ class MusicCog(commands.Cog):
         gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
         gq.loop_mode = gq.loop_mode.next()
         await interaction.response.send_message(f"Loop mode: **{gq.loop_mode.label()}**.")
+
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """Auto-disconnect when the bot is left alone in a voice channel."""
+        if member.bot:
+            return
+
+        # Only care about someone leaving the bot's channel
+        if before.channel is None:
+            return
+
+        vc: Optional[discord.VoiceClient] = member.guild.voice_client  # type: ignore[assignment]
+        if vc is None or vc.channel != before.channel:
+            return
+
+        # Check if bot is the only one left
+        non_bot_members = [m for m in before.channel.members if not m.bot]
+        if len(non_bot_members) == 0:
+            gq = self.queues.get(member.guild.id)
+            gq.clear()
+            vc.stop()
+            await vc.disconnect()
+            self.queues.remove(member.guild.id)
 
 
 async def setup(bot: commands.Bot) -> None:
