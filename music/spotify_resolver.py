@@ -54,6 +54,32 @@ class SpotifyResolver:
             )
         return tracks
 
+    def recommend(self, query: str) -> TrackInfo | None:
+        """Search Spotify for a track matching query, then return a recommendation."""
+        if not self._sp:
+            return None
+        # Find a seed track
+        results = self._sp.search(q=query, type="track", limit=1)
+        items = results.get("tracks", {}).get("items", [])
+        if not items:
+            return None
+        seed_id = items[0]["id"]
+        # Get recommendations
+        recs = self._sp.recommendations(seed_tracks=[seed_id], limit=5)
+        rec_tracks = recs.get("tracks", [])
+        if not rec_tracks:
+            return None
+        # Pick first that isn't the seed
+        for track in rec_tracks:
+            if track["id"] != seed_id:
+                title = self._format_track(track)
+                return TrackInfo(
+                    title=title,
+                    url=f"ytsearch:{title}",
+                    duration=track.get("duration_ms", 0) // 1000,
+                )
+        return None
+
     def resolve_track(self, track_id: str) -> list[str]:
         if not self._sp:
             return []

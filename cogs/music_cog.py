@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -26,6 +27,15 @@ def format_duration(seconds: int) -> str:
     if h:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
+
+
+def progress_bar(elapsed: int, total: int, length: int = 12) -> str:
+    if total <= 0:
+        return f"{format_duration(elapsed)} / LIVE"
+    elapsed = min(elapsed, total)
+    filled = round(length * elapsed / total)
+    bar = "▬" * filled + "🔘" + "▬" * (length - filled)
+    return f"{format_duration(elapsed)} {bar} {format_duration(total)}"
 
 
 class SearchView(discord.ui.View):
@@ -167,8 +177,21 @@ class MusicCog(commands.Cog):
 
         track = gq.next_track()
         if track is None:
-            self.bot.loop.call_later(300, self._check_idle, guild)
-            return
+            # Autoplay: recommend a track based on what just played
+            if gq.autoplay and self.spotify.available and gq.current is not None:
+                try:
+                    rec = await self.bot.loop.run_in_executor(
+                        None, self.spotify.recommend, gq.current.title
+                    )
+                    if rec:
+                        gq.add(rec)
+                        track = gq.next_track()
+                except Exception as exc:
+                    log.warning("Autoplay recommendation failed: %s", exc)
+
+            if track is None:
+                self.bot.loop.call_later(300, self._check_idle, guild)
+                return
 
         try:
             source = await YTDLSource.from_query(
@@ -180,6 +203,7 @@ class MusicCog(commands.Cog):
             await self._play_next(guild)
             return
 
+        gq.play_start_time = time.time()
         vc.play(source, after=lambda e: self._after_play(guild, e))
 
     async def _enqueue_and_play(
@@ -471,14 +495,17 @@ class MusicCog(commands.Cog):
             return
 
         track = gq.current
+        elapsed = int(time.time() - gq.play_start_time) if gq.play_start_time else 0
+
         embed = discord.Embed(
             title="Now Playing",
-            description=f"**{track.title}**",
+            description=f"**{track.title}**\n{progress_bar(elapsed, track.duration)}",
             color=discord.Color.green(),
         )
-        embed.add_field(name="Duration", value=format_duration(track.duration))
         embed.add_field(name="Requested by", value=track.requester or "Unknown")
         embed.add_field(name="Loop", value=gq.loop_mode.label())
+        if gq.autoplay:
+            embed.add_field(name="Autoplay", value="on")
         if track.thumbnail:
             embed.set_thumbnail(url=track.thumbnail)
         if track.url:
@@ -502,6 +529,7 @@ class MusicCog(commands.Cog):
         if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
             vc.source.volume = gq.volume
 
+        self.queues.save_settings()
         await interaction.response.send_message(f"Volume set to **{level}%**.")
 
     async def _do_youtube_search(self, interaction: discord.Interaction, query: str) -> None:
@@ -577,6 +605,7 @@ class MusicCog(commands.Cog):
             gq.search_mode = "spotify"
         else:
             gq.search_mode = "youtube"
+        self.queues.save_settings()
         await interaction.response.send_message(
             f"Default search mode set to **{gq.search_mode}**."
         )
@@ -591,6 +620,7 @@ class MusicCog(commands.Cog):
             return
         gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
         gq.max_queue = size
+        self.queues.save_settings()
         await interaction.response.send_message(f"Max queue size set to **{size}**.")
 
     @app_commands.command(name="remove", description="Remove a track from the queue")
@@ -652,6 +682,18 @@ class MusicCog(commands.Cog):
         gq.loop_mode = gq.loop_mode.next()
         await interaction.response.send_message(f"Loop mode: **{gq.loop_mode.label()}**.")
 
+    @app_commands.command(name="autoplay", description="Toggle autoplay — auto-queue similar tracks when the queue runs out")
+    async def autoplay(self, interaction: discord.Interaction) -> None:
+        if not self.spotify.available:
+            await interaction.response.send_message(
+                "Autoplay requires Spotify credentials.", ephemeral=True
+            )
+            return
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        gq.autoplay = not gq.autoplay
+        self.queues.save_settings()
+        state = "on" if gq.autoplay else "off"
+        await interaction.response.send_message(f"Autoplay is now **{state}**.")
 
     @commands.Cog.listener()
     async def on_voice_state_update(

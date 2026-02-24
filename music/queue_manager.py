@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import json
+import logging
 import random
 from collections import deque
 from enum import Enum, auto
+from pathlib import Path
 
 from .audio_source import TrackInfo
+
+log = logging.getLogger(__name__)
 
 
 class LoopMode(Enum):
@@ -35,6 +40,8 @@ class GuildQueue:
         self.volume: float = 0.5
         self.search_mode: str = "youtube"
         self.max_queue: int = 50
+        self.play_start_time: float = 0.0
+        self.autoplay: bool = False
 
     def add(self, track: TrackInfo) -> int | None:
         """Add a track and return its position (1-indexed), or None if queue is full."""
@@ -86,15 +93,45 @@ class GuildQueue:
         self.loop_mode = LoopMode.OFF
 
 
+_SETTINGS_KEYS = ("volume", "search_mode", "max_queue", "autoplay")
+
+
 class QueueManager:
     """Holds per-guild queues."""
 
-    def __init__(self) -> None:
+    def __init__(self, settings_path: str = "/data/settings.json") -> None:
         self._guilds: dict[int, GuildQueue] = {}
+        self._settings_path = Path(settings_path)
+        self._settings: dict[str, dict] = {}
+        self._load_settings()
+
+    def _load_settings(self) -> None:
+        if self._settings_path.exists():
+            try:
+                self._settings = json.loads(self._settings_path.read_text())
+            except Exception as exc:
+                log.warning("Failed to load settings: %s", exc)
+
+    def save_settings(self) -> None:
+        for guild_id, gq in self._guilds.items():
+            self._settings[str(guild_id)] = {
+                k: getattr(gq, k) for k in _SETTINGS_KEYS
+            }
+        try:
+            self._settings_path.parent.mkdir(parents=True, exist_ok=True)
+            self._settings_path.write_text(json.dumps(self._settings, indent=2))
+        except Exception as exc:
+            log.warning("Failed to save settings: %s", exc)
 
     def get(self, guild_id: int) -> GuildQueue:
         if guild_id not in self._guilds:
-            self._guilds[guild_id] = GuildQueue()
+            gq = GuildQueue()
+            saved = self._settings.get(str(guild_id))
+            if saved:
+                for k in _SETTINGS_KEYS:
+                    if k in saved:
+                        setattr(gq, k, saved[k])
+            self._guilds[guild_id] = gq
         return self._guilds[guild_id]
 
     def remove(self, guild_id: int) -> None:
