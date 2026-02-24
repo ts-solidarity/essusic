@@ -96,6 +96,7 @@ class MusicCog(commands.Cog):
 
         if vc is None:
             vc = await channel.connect(self_deaf=True)
+            vc.encoder.set_bitrate(96)
         elif vc.channel != channel:
             await vc.move_to(channel)
 
