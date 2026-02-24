@@ -146,6 +146,14 @@ class MusicCog(commands.Cog):
         gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
         pos = gq.add(track)
 
+        if pos is None:
+            msg = f"Queue is full ({gq.max_queue} tracks max)."
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+            return
+
         if not vc.is_playing() and not vc.is_paused():
             await self._play_next(interaction.guild)  # type: ignore[arg-type]
             msg = f"Now playing: **{track.title}**"
@@ -200,28 +208,24 @@ class MusicCog(commands.Cog):
                 return
 
             gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
-            first_track = None
+            count = 0
             for s in search_strings:
                 track = TrackInfo(
                     title=s,
                     url=f"ytsearch:{s}",
                     requester=interaction.user.display_name,
                 )
-                gq.add(track)
-                if first_track is None:
-                    first_track = track
+                if gq.add(track) is None:
+                    break
+                count += 1
 
             if not vc.is_playing() and not vc.is_paused():
                 await self._play_next(interaction.guild)  # type: ignore[arg-type]
 
-            if len(search_strings) == 1:
-                await interaction.followup.send(
-                    f"Queued **{search_strings[0]}** from Spotify."
-                )
-            else:
-                await interaction.followup.send(
-                    f"Queued **{len(search_strings)} tracks** from Spotify."
-                )
+            msg = f"Queued **{count} track{'s' if count != 1 else ''}** from Spotify."
+            if count < len(search_strings):
+                msg += f" ({len(search_strings) - count} skipped — queue full)"
+            await interaction.followup.send(msg)
             return
 
         # YouTube playlist
@@ -257,6 +261,7 @@ class MusicCog(commands.Cog):
 
             gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
             count = 0
+            skipped = 0
             for entry in entries:
                 if entry is None:
                     continue
@@ -268,16 +273,19 @@ class MusicCog(commands.Cog):
                     thumbnail=entry.get("thumbnail", ""),
                     requester=interaction.user.display_name,
                 )
-                gq.add(track)
+                if gq.add(track) is None:
+                    skipped = sum(1 for e in entries if e is not None) - count
+                    break
                 count += 1
 
             if not vc.is_playing() and not vc.is_paused():
                 await self._play_next(interaction.guild)  # type: ignore[arg-type]
 
             playlist_title = data.get("title", "YouTube playlist")
-            await interaction.followup.send(
-                f"Queued **{count} tracks** from **{playlist_title}**."
-            )
+            msg = f"Queued **{count} tracks** from **{playlist_title}**."
+            if skipped:
+                msg += f" ({skipped} skipped — queue full)"
+            await interaction.followup.send(msg)
             return
 
         # YouTube URL or search
@@ -501,6 +509,18 @@ class MusicCog(commands.Cog):
         await interaction.response.send_message(
             f"Default search mode set to **{gq.search_mode}**."
         )
+
+    @app_commands.command(name="maxqueue", description="Set the maximum queue size")
+    @app_commands.describe(size="Maximum number of tracks in the queue (1-500)")
+    async def maxqueue(self, interaction: discord.Interaction, size: int) -> None:
+        if not 1 <= size <= 500:
+            await interaction.response.send_message(
+                "Max queue size must be between 1 and 500.", ephemeral=True
+            )
+            return
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        gq.max_queue = size
+        await interaction.response.send_message(f"Max queue size set to **{size}**.")
 
     @app_commands.command(name="shuffle", description="Shuffle the queue")
     async def shuffle(self, interaction: discord.Interaction) -> None:

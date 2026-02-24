@@ -34,9 +34,12 @@ class GuildQueue:
         self.loop_mode: LoopMode = LoopMode.OFF
         self.volume: float = 0.5
         self.search_mode: str = "youtube"
+        self.max_queue: int = 50
 
-    def add(self, track: TrackInfo) -> int:
-        """Add a track and return its position (1-indexed)."""
+    def add(self, track: TrackInfo) -> int | None:
+        """Add a track and return its position (1-indexed), or None if queue is full."""
+        if len(self.queue) >= self.max_queue:
+            return None
         self.queue.append(track)
         return len(self.queue)
 
