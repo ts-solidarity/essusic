@@ -27,6 +27,13 @@ FFMPEG_OPTIONS = {
     "options": "-vn -ar 48000",
 }
 
+AUDIO_FILTERS: dict[str, str] = {
+    "bassboost": "bass=g=10,acompressor=threshold=0.5",
+    "nightcore": "aresample=48000,asetrate=48000*1.25",
+    "vaporwave": "aresample=48000,asetrate=48000*0.8",
+    "8d": "apulsator=hz=0.08",
+}
+
 
 @dataclass
 class TrackInfo:
@@ -43,17 +50,30 @@ class YTDLSource(discord.PCMVolumeTransformer):
     """Wraps FFmpegPCMAudio with volume control and metadata."""
 
     def __init__(
-        self, source: discord.AudioSource, *, data: dict, volume: float = 0.5
+        self,
+        source: discord.AudioSource,
+        *,
+        data: dict,
+        volume: float = 0.5,
+        stream_url: str = "",
     ) -> None:
         super().__init__(source, volume)
         self.title: str = data.get("title", "Unknown")
         self.url: str = data.get("webpage_url", "")
         self.duration: int = int(data.get("duration", 0) or 0)
         self.thumbnail: str = data.get("thumbnail", "")
+        self.stream_url: str = stream_url
+        self._data: dict = data
 
     @classmethod
     async def from_query(
-        cls, query: str, *, loop: asyncio.AbstractEventLoop, volume: float = 0.5
+        cls,
+        query: str,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        volume: float = 0.5,
+        filter_name: str | None = None,
+        seek_seconds: int = 0,
     ) -> YTDLSource:
         """Create a playable source from a URL or search query."""
         ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
@@ -64,9 +84,47 @@ class YTDLSource(discord.PCMVolumeTransformer):
         if "entries" in data:
             data = data["entries"][0]
 
-        stream_url = data["url"]
-        source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
-        return cls(source, data=data, volume=volume)
+        url = data["url"]
+        return cls._build(url, data=data, volume=volume,
+                          filter_name=filter_name, seek_seconds=seek_seconds)
+
+    @classmethod
+    def from_stream_url(
+        cls,
+        stream_url: str,
+        *,
+        data: dict,
+        volume: float = 0.5,
+        filter_name: str | None = None,
+        seek_seconds: int = 0,
+    ) -> YTDLSource:
+        """Rebuild an FFmpeg source from a cached stream URL (no yt-dlp fetch)."""
+        return cls._build(stream_url, data=data, volume=volume,
+                          filter_name=filter_name, seek_seconds=seek_seconds)
+
+    @classmethod
+    def _build(
+        cls,
+        stream_url: str,
+        *,
+        data: dict,
+        volume: float,
+        filter_name: str | None,
+        seek_seconds: int,
+    ) -> YTDLSource:
+        before = FFMPEG_OPTIONS["before_options"]
+        opts = FFMPEG_OPTIONS["options"]
+
+        if seek_seconds > 0:
+            before = f"-ss {seek_seconds} " + before
+
+        if filter_name and filter_name in AUDIO_FILTERS:
+            opts = opts + f" -af {AUDIO_FILTERS[filter_name]}"
+
+        source = discord.FFmpegPCMAudio(
+            stream_url, before_options=before, options=opts
+        )
+        return cls(source, data=data, volume=volume, stream_url=stream_url)
 
     @staticmethod
     async def search(

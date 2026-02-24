@@ -42,6 +42,9 @@ class GuildQueue:
         self.max_queue: int = 50
         self.play_start_time: float = 0.0
         self.autoplay: bool = False
+        self.filter_name: str | None = None
+        self._restarting: bool = False
+        self.skip_votes: set[int] = set()
 
     def add(self, track: TrackInfo) -> int | None:
         """Add a track and return its position (1-indexed), or None if queue is full."""
@@ -52,6 +55,7 @@ class GuildQueue:
 
     def next_track(self) -> TrackInfo | None:
         """Advance the queue respecting loop mode. Returns the next TrackInfo or None."""
+        self.skip_votes.clear()
         if self.loop_mode == LoopMode.SINGLE and self.current is not None:
             return self.current
 
@@ -93,7 +97,7 @@ class GuildQueue:
         self.loop_mode = LoopMode.OFF
 
 
-_SETTINGS_KEYS = ("volume", "search_mode", "max_queue", "autoplay")
+_SETTINGS_KEYS = ("volume", "search_mode", "max_queue", "autoplay", "filter_name")
 
 
 class QueueManager:
@@ -136,3 +140,108 @@ class QueueManager:
 
     def remove(self, guild_id: int) -> None:
         self._guilds.pop(guild_id, None)
+
+
+class HistoryManager:
+    """Tracks play history per guild, capped at 500 entries."""
+
+    def __init__(self, path: str = "/data/history.json") -> None:
+        self._path = Path(path)
+        self._data: dict[str, list[dict]] = {}
+        if self._path.exists():
+            try:
+                self._data = json.loads(self._path.read_text())
+            except Exception as exc:
+                log.warning("Failed to load history: %s", exc)
+
+    def _save(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(self._data, indent=2))
+        except Exception as exc:
+            log.warning("Failed to save history: %s", exc)
+
+    def record(self, guild_id: int, track: TrackInfo) -> None:
+        import time
+
+        key = str(guild_id)
+        entries = self._data.setdefault(key, [])
+        entries.append({"title": track.title, "url": track.url, "ts": time.time()})
+        if len(entries) > 500:
+            self._data[key] = entries[-500:]
+        self._save()
+
+    def top(self, guild_id: int, limit: int = 10) -> list[tuple[str, str, int]]:
+        """Return top tracks as (title, url, count) sorted by play count."""
+        from collections import Counter
+
+        entries = self._data.get(str(guild_id), [])
+        counts: Counter[str] = Counter()
+        url_map: dict[str, str] = {}
+        for e in entries:
+            title = e["title"]
+            counts[title] += 1
+            url_map[title] = e.get("url", "")
+        return [(t, url_map[t], c) for t, c in counts.most_common(limit)]
+
+
+class FavoritesManager:
+    """Per-user favorites, max 50 per user."""
+
+    def __init__(self, path: str = "/data/favorites.json") -> None:
+        self._path = Path(path)
+        self._data: dict[str, list[dict]] = {}
+        if self._path.exists():
+            try:
+                self._data = json.loads(self._path.read_text())
+            except Exception as exc:
+                log.warning("Failed to load favorites: %s", exc)
+
+    def _save(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._path.write_text(json.dumps(self._data, indent=2))
+        except Exception as exc:
+            log.warning("Failed to save favorites: %s", exc)
+
+    def add(self, user_id: int, track: TrackInfo) -> bool:
+        """Add a track. Returns False if already at max or duplicate."""
+        key = str(user_id)
+        favs = self._data.setdefault(key, [])
+        if len(favs) >= 50:
+            return False
+        if any(f["url"] == track.url for f in favs):
+            return False
+        favs.append({
+            "title": track.title,
+            "url": track.url,
+            "duration": track.duration,
+            "thumbnail": track.thumbnail,
+        })
+        self._save()
+        return True
+
+    def remove(self, user_id: int, index: int) -> dict | None:
+        """Remove by 0-based index. Returns the removed entry or None."""
+        key = str(user_id)
+        favs = self._data.get(key, [])
+        if index < 0 or index >= len(favs):
+            return None
+        removed = favs.pop(index)
+        self._save()
+        return removed
+
+    def list(self, user_id: int) -> list[dict]:
+        return self._data.get(str(user_id), [])
+
+    def as_tracks(self, user_id: int, requester: str = "") -> list[TrackInfo]:
+        return [
+            TrackInfo(
+                title=f["title"],
+                url=f["url"],
+                duration=f.get("duration", 0),
+                thumbnail=f.get("thumbnail", ""),
+                requester=requester,
+            )
+            for f in self.list(user_id)
+        ]
