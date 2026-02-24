@@ -320,7 +320,7 @@ class PlayerView(discord.ui.View):
     """Interactive music player with controls, progress bar, and seek."""
 
     def __init__(self, cog: MusicCog, guild: discord.Guild) -> None:
-        super().__init__(timeout=600)
+        super().__init__(timeout=None)
         self.cog = cog
         self.guild = guild
         self.message: discord.Message | None = None
@@ -396,7 +396,7 @@ class PlayerView(discord.ui.View):
         await interaction.response.defer()
         await self.cog._restart_playback(self.guild, seek_seconds=secs)
         await asyncio.sleep(0.5)
-        await self._refresh()
+        await self._update_player()
 
     def _build_embed(self) -> discord.Embed:
         gq = self.cog.queues.get(self.guild.id)
@@ -457,11 +457,11 @@ class PlayerView(discord.ui.View):
                 await asyncio.sleep(10)
                 if self.message is None:
                     break
-                await self._refresh()
+                await self._update_player()
         except asyncio.CancelledError:
             pass
 
-    async def _refresh(self) -> None:
+    async def _update_player(self) -> None:
         embed = self._build_embed()
         self._sync_pause_button()
         if self.message:
@@ -499,7 +499,7 @@ class PlayerView(discord.ui.View):
             vc.stop()
         await interaction.response.defer()
         await asyncio.sleep(1.5)
-        await self._refresh()
+        await self._update_player()
 
     @discord.ui.button(emoji="\u23ea", style=discord.ButtonStyle.secondary, row=0)
     async def rewind_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -516,7 +516,7 @@ class PlayerView(discord.ui.View):
         await interaction.response.defer()
         await self.cog._restart_playback(self.guild, seek_seconds=seek_to)
         await asyncio.sleep(0.5)
-        await self._refresh()
+        await self._update_player()
 
     @discord.ui.button(emoji="\u23f8", style=discord.ButtonStyle.secondary, row=0)
     async def pause_resume_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -532,7 +532,7 @@ class PlayerView(discord.ui.View):
             await interaction.response.send_message("Nothing is playing.", ephemeral=True)
             return
         await interaction.response.defer()
-        await self._refresh()
+        await self._update_player()
 
     @discord.ui.button(emoji="\u23e9", style=discord.ButtonStyle.secondary, row=0)
     async def forward_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -552,7 +552,7 @@ class PlayerView(discord.ui.View):
         await interaction.response.defer()
         await self.cog._restart_playback(self.guild, seek_seconds=seek_to)
         await asyncio.sleep(0.5)
-        await self._refresh()
+        await self._update_player()
 
     @discord.ui.button(emoji="\u23ed", style=discord.ButtonStyle.secondary, row=0)
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -567,7 +567,7 @@ class PlayerView(discord.ui.View):
         vc.stop()
         await interaction.response.defer()
         await asyncio.sleep(1.5)
-        await self._refresh()
+        await self._update_player()
 
     # Row 2: volume controls
 
@@ -580,7 +580,7 @@ class PlayerView(discord.ui.View):
             vc.source.volume = gq.volume
         self.cog.queues.save_settings()
         await interaction.response.defer()
-        await self._refresh()
+        await self._update_player()
 
     @discord.ui.button(emoji="\U0001f50a", style=discord.ButtonStyle.secondary, row=2)
     async def vol_up_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -591,7 +591,7 @@ class PlayerView(discord.ui.View):
             vc.source.volume = gq.volume
         self.cog.queues.save_settings()
         await interaction.response.defer()
-        await self._refresh()
+        await self._update_player()
 
 
 class QueueView(discord.ui.View):
@@ -669,6 +669,14 @@ class MusicCog(commands.Cog):
         self._crossfade_timers: dict[int, asyncio.TimerHandle] = {}
 
     # ── helpers ──────────────────────────────────────────────────────────
+
+    def _cleanup_player(self, guild_id: int) -> None:
+        """Stop and remove the active PlayerView for a guild."""
+        old = self._active_players.pop(guild_id, None)
+        if old:
+            if old._update_task and not old._update_task.done():
+                old._update_task.cancel()
+            old.stop()
 
     def _get_elapsed(self, gq: GuildQueue) -> int:
         """Get elapsed playback time in seconds, accounting for speed."""
@@ -1303,6 +1311,7 @@ class MusicCog(commands.Cog):
         gq.clear()
         self.queues.clear_queue_state(interaction.guild.id)  # type: ignore[union-attr]
         self._cancel_crossfade_timer(interaction.guild.id)  # type: ignore[union-attr]
+        self._cleanup_player(interaction.guild.id)  # type: ignore[union-attr]
         vc.stop()
         await vc.disconnect()
         metric_voice_connections.dec()
@@ -2670,6 +2679,7 @@ class MusicCog(commands.Cog):
             gq.clear()
             self.queues.clear_queue_state(member.guild.id)
             self._cancel_crossfade_timer(member.guild.id)
+            self._cleanup_player(member.guild.id)
             vc.stop()
             await vc.disconnect()
             metric_voice_connections.dec()
