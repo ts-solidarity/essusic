@@ -4,6 +4,7 @@ from enum import Enum, auto
 
 class InputType(Enum):
     YOUTUBE_URL = auto()
+    YOUTUBE_PLAYLIST = auto()
     SPOTIFY_TRACK = auto()
     SPOTIFY_PLAYLIST = auto()
     SPOTIFY_ALBUM = auto()
@@ -39,6 +40,8 @@ def classify(query: str) -> tuple[InputType, str]:
         return type_map[kind], spotify_id
 
     if _YOUTUBE_RE.match(query):
+        if "list=" in query:
+            return InputType.YOUTUBE_PLAYLIST, query
         return InputType.YOUTUBE_URL, query
 
     return InputType.SEARCH_QUERY, query

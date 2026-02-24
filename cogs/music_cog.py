@@ -224,6 +224,57 @@ class MusicCog(commands.Cog):
                 )
             return
 
+        # YouTube playlist
+        if input_type == InputType.YOUTUBE_PLAYLIST:
+            await interaction.response.defer()
+            try:
+                import yt_dlp
+                from music.audio_source import YTDL_OPTIONS
+
+                ytdl = yt_dlp.YoutubeDL(
+                    {**YTDL_OPTIONS, "noplaylist": False, "extract_flat": "in_playlist"}
+                )
+                data = await self.bot.loop.run_in_executor(
+                    None, lambda: ytdl.extract_info(value, download=False)
+                )
+            except Exception as exc:
+                await interaction.followup.send(f"Could not load playlist: {exc}")
+                return
+
+            entries = data.get("entries") or []
+            if not entries:
+                await interaction.followup.send("No tracks found in that playlist.")
+                return
+
+            vc = await self._ensure_voice(interaction)
+            if vc is None:
+                return
+
+            gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+            count = 0
+            for entry in entries:
+                if entry is None:
+                    continue
+                url = entry.get("webpage_url") or entry.get("url", "")
+                track = TrackInfo(
+                    title=entry.get("title", "Unknown"),
+                    url=url,
+                    duration=int(entry.get("duration", 0) or 0),
+                    thumbnail=entry.get("thumbnail", ""),
+                    requester=interaction.user.display_name,
+                )
+                gq.add(track)
+                count += 1
+
+            if not vc.is_playing() and not vc.is_paused():
+                await self._play_next(interaction.guild)  # type: ignore[arg-type]
+
+            playlist_title = data.get("title", "YouTube playlist")
+            await interaction.followup.send(
+                f"Queued **{count} tracks** from **{playlist_title}**."
+            )
+            return
+
         # YouTube URL or search
         await interaction.response.defer()
 
