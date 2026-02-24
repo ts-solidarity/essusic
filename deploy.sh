@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOST="${1:?Usage: ./deploy.sh user@host [browser]}"
+HOST="${1:?Usage: ./deploy.sh host [browser]}"
 BROWSER="${2:-brave}"
 REMOTE_DIR="/opt/essusic"
 
