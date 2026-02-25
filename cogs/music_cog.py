@@ -673,6 +673,177 @@ class QueueView(discord.ui.View):
             item.disabled = True  # type: ignore[union-attr]
 
 
+_HELP_CATEGORIES: list[tuple[str, str, list[tuple[str, str]]]] = [
+    (
+        "🎵 Playback",
+        "playback",
+        [
+            ("/play", "Play from a YouTube/Spotify URL or search keywords"),
+            ("/skip", "Skip the current track and play the next one"),
+            ("/stop", "Stop playback, clear queue, and disconnect"),
+            ("/pause", "Pause playback"),
+            ("/resume", "Resume playback"),
+            ("/replay", "Restart the current track from the beginning"),
+            ("/back", "Play the previous track"),
+            ("/voteskip", "Start a skip vote — requires half the listeners to agree"),
+        ],
+    ),
+    (
+        "📋 Queue",
+        "queue",
+        [
+            ("/queue", "Show the current queue"),
+            ("/remove `<pos>`", "Remove a track by position"),
+            ("/move `<from>` `<to>`", "Move a track to a different position"),
+            ("/skipto `<pos>`", "Jump to a specific position in the queue"),
+            ("/clear", "Clear the queue (keeps current track playing)"),
+            ("/shuffle", "Shuffle the queue, spreading same-artist tracks evenly"),
+            ("/undo", "Revert the last queue change"),
+            ("/queue-export", "Export the queue as a shareable code"),
+            ("/queue-import `<code>`", "Import a queue from an exported code"),
+        ],
+    ),
+    (
+        "🔊 Audio",
+        "audio",
+        [
+            ("/volume `<1-100>`", "Adjust playback volume"),
+            ("/filter", "Apply an audio filter (Bass Boost, Nightcore, Vaporwave, 8D)"),
+            ("/seek `<time>`", "Seek to a position, e.g. `1:30` or `90`"),
+            ("/speed `<0.5-2.0>`", "Set playback speed"),
+            ("/normalize", "Toggle loudness normalization to balance volume differences"),
+            ("/eq", "Apply an EQ preset (Flat, Bass Heavy, Treble Heavy, Vocal, Electronic)"),
+            ("/eqcustom `<band>` `<gain>`", "Boost or cut a specific frequency band (-12 to +12 dB)"),
+            ("/crossfade `<0-10>`", "Set crossfade duration between tracks"),
+        ],
+    ),
+    (
+        "🎛️ Player",
+        "player",
+        [
+            ("/nowplaying", "Show the currently playing track with progress bar"),
+            ("/player", "Open an interactive player with playback controls"),
+            ("/loop", "Cycle loop mode: off → single → queue → off"),
+            ("/autoplay", "Auto-queue similar tracks when the queue runs out"),
+            ("/lyrics", "Show lyrics for the current or a specified track"),
+            ("/grab", "Send the current track info to your DMs"),
+        ],
+    ),
+    (
+        "📻 Radio",
+        "radio",
+        [
+            ("/radio `<seed>`", "Start endless radio seeded by an artist or genre"),
+            ("/radio-off", "Stop radio mode"),
+            ("/similar", "Show Spotify recommendations based on the current track"),
+        ],
+    ),
+    (
+        "❤️ Favorites",
+        "favorites",
+        [
+            ("/fav", "Save the current track to your favorites"),
+            ("/favs", "List your favorite tracks"),
+            ("/unfav `<pos>`", "Remove a track from your favorites by position"),
+            ("/playfavs", "Queue all your favorite tracks"),
+        ],
+    ),
+    (
+        "📁 Playlists",
+        "playlists",
+        [
+            ("/playlist save `<name>`", "Save the current queue as a named playlist"),
+            ("/playlist load `<name>`", "Queue tracks from a saved playlist"),
+            ("/playlist list", "List all saved playlists"),
+            ("/playlist delete `<name>`", "Delete a saved playlist"),
+            ("/playlist addtrack `<name>`", "Add the current track to a playlist"),
+            ("/playlist removetrack `<name>` `<pos>`", "Remove a track from a playlist"),
+            ("/playlist adduser `<name>` `<user>`", "Add a collaborator to a playlist"),
+            ("/playlist removeuser `<name>` `<user>`", "Remove a collaborator from a playlist"),
+        ],
+    ),
+    (
+        "🏆 Stats & Social",
+        "stats",
+        [
+            ("/top", "Show the most played tracks in this server"),
+            ("/toprated", "Show the highest-rated tracks in this server"),
+            ("/rate", "Rate the current track with thumbs up / down"),
+            ("/stats", "Show server-wide listening stats"),
+            ("/mystats", "Show your personal listening history and top tracks"),
+            ("/search", "Search and pick from results (uses server default)"),
+            ("/youtube-search", "Search YouTube and pick from results"),
+            ("/spotify-search", "Search Spotify and pick from results"),
+            ("/searchmode", "Toggle default search between YouTube and Spotify"),
+        ],
+    ),
+    (
+        "⚙️ Settings",
+        "settings",
+        [
+            ("/maxqueue `<size>`", "Set the maximum queue size (default 50)"),
+            ("/dj `<role>`", "Restrict bot controls to a DJ role (admin only)"),
+            ("/djclear", "Remove the DJ role restriction (admin only)"),
+            ("/djmode", "Require DJ approval before non-DJs can add tracks (admin only)"),
+            ("/24-7", "Keep the bot connected even when idle or alone"),
+            ("/language `<lang>`", "Set the bot language for this server"),
+        ],
+    ),
+]
+
+
+def _build_help_embed(category_id: str) -> discord.Embed:
+    for label, cid, commands_list in _HELP_CATEGORIES:
+        if cid == category_id:
+            lines = [f"`{cmd}` — {desc}" for cmd, desc in commands_list]
+            return discord.Embed(
+                title=label,
+                description="\n".join(lines),
+                color=discord.Color.blurple(),
+            )
+    # Overview
+    lines = []
+    for label, _cid, cmds in _HELP_CATEGORIES:
+        lines.append(f"{label} — {len(cmds)} commands")
+    embed = discord.Embed(
+        title="🎵 Essusic — Help",
+        description=(
+            "A feature-rich music bot for Discord.\n"
+            "Use the menu below to browse commands by category.\n\n"
+            + "\n".join(lines)
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="Tip: Use /player for an interactive control panel")
+    return embed
+
+
+class HelpView(discord.ui.View):
+    """Category select menu for /help."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=120)
+        options = [
+            discord.SelectOption(label=label, value=cid, description=f"{len(cmds)} commands")
+            for label, cid, cmds in _HELP_CATEGORIES
+        ]
+        select = discord.ui.Select(
+            placeholder="Browse a category…",
+            options=options,
+        )
+        select.callback = self._on_select
+        self.add_item(select)
+        self._select = select
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        chosen = self._select.values[0]
+        await interaction.response.edit_message(embed=_build_help_embed(chosen), view=self)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore[union-attr]
+
+
 class MusicCog(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -2725,6 +2896,16 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("🎵 Crossfade disabled.")
         else:
             await interaction.response.send_message(f"🎵 Crossfade: **{seconds}s**.")
+
+    # ── help ─────────────────────────────────────────────────────────────
+
+    @app_commands.command(name="help", description="Browse all bot commands by category")
+    async def help(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(
+            embed=_build_help_embed("overview"),
+            view=HelpView(),
+            ephemeral=True,
+        )
 
     @commands.Cog.listener()
     async def on_voice_state_update(
