@@ -319,84 +319,67 @@ class DJApprovalView(discord.ui.View):
 class PlayerView(discord.ui.View):
     """Interactive music player with controls, progress bar, and seek."""
 
+    SEEK_SEGMENTS = 5
+
     def __init__(self, cog: MusicCog, guild: discord.Guild) -> None:
         super().__init__(timeout=None)
         self.cog = cog
         self.guild = guild
         self.message: discord.Message | None = None
         self._update_task: asyncio.Task | None = None
-        self._build_seek_menu()
+        self._build_seek_bar()
 
-    def _build_seek_menu_safe(self) -> None:
-        """Rebuild the seek menu, removing the old one first."""
-        # Remove old select menu
-        to_remove = [c for c in self.children if isinstance(c, discord.ui.Select)]
-        for c in to_remove:
-            self.remove_item(c)
-        self._build_seek_menu()
+    # ── Clickable seek bar (row 1) ────────────────────────────────────────
 
-    def _build_seek_menu(self) -> None:
+    def _build_seek_bar(self) -> None:
+        """Add a row of buttons that act as a clickable progress bar."""
         gq = self.cog.queues.get(self.guild.id)
         if not gq.current or gq.current.duration <= 0:
             return
         dur = gq.current.duration
+        elapsed = self.cog._get_elapsed(gq)
 
-        # Pick an interval that gives 15-25 options (Discord max is 25)
-        if dur <= 120:        # <=2m  → every 10s
-            step = 10
-        elif dur <= 300:     # <=5m  → every 15s
-            step = 15
-        elif dur <= 600:     # <=10m → every 30s
-            step = 30
-        elif dur <= 1800:    # <=30m → every 60s
-            step = 60
-        elif dur <= 3600:    # <=1h  → every 2m
-            step = 120
-        elif dur <= 7200:    # <=2h  → every 5m
-            step = 300
-        else:                # >2h   → every 10m
-            step = 600
+        for i in range(self.SEEK_SEGMENTS):
+            seg_start = int(dur * i / self.SEEK_SEGMENTS)
+            seg_end = int(dur * (i + 1) / self.SEEK_SEGMENTS)
+            is_current = seg_start <= elapsed < seg_end or (i == self.SEEK_SEGMENTS - 1 and elapsed >= seg_start)
 
-        options: list[discord.SelectOption] = []
-        t = 0
-        while t < dur and len(options) < 25:
-            pct = int(t / dur * 100)
-            bar_len = 10
-            filled = round(bar_len * t / dur)
-            bar = "\u25ac" * filled + "\U0001f518" + "\u25ac" * (bar_len - filled)
-            options.append(discord.SelectOption(
-                label=f"{format_duration(t)}  /  {format_duration(dur)}",
-                value=str(t),
-                description=f"{bar}  ({pct}%)",
-            ))
-            t += step
+            if is_current:
+                label = f"\U0001f518 {format_duration(elapsed)}"
+                style = discord.ButtonStyle.primary
+            else:
+                label = f"\u25ac {format_duration(seg_start)}"
+                style = discord.ButtonStyle.secondary
 
-        if not options:
-            return
+            btn = discord.ui.Button(label=label, style=style, row=1)
+            btn.callback = self._make_seek_cb(seg_start)
+            self.add_item(btn)
 
-        select = discord.ui.Select(
-            placeholder=f"\u23e9  Seek  \u2014  {format_duration(dur)}",
-            options=options,
-            row=1,
-        )
-        select.callback = self._on_seek
-        self.add_item(select)
+    def _rebuild_seek_bar(self) -> None:
+        """Remove old seek buttons and rebuild with updated position."""
+        # Row 1 buttons are the seek bar — remove them
+        to_remove = [c for c in self.children
+                     if isinstance(c, discord.ui.Button) and c.row == 1]
+        for c in to_remove:
+            self.remove_item(c)
+        self._build_seek_bar()
 
-    async def _on_seek(self, interaction: discord.Interaction) -> None:
-        gq = self.cog.queues.get(self.guild.id)
-        if err := _check_dj(interaction, gq):
-            await interaction.response.send_message(err, ephemeral=True)
-            return
-        if gq.current is None:
-            await interaction.response.send_message("Nothing is playing.", ephemeral=True)
-            return
-        secs = int(interaction.data["values"][0])
-        if gq.current.duration and secs >= gq.current.duration:
-            secs = max(0, gq.current.duration - 1)
-        await interaction.response.defer()
-        await self.cog._restart_playback(self.guild, seek_seconds=secs)
-        await asyncio.sleep(0.5)
-        await self._update_player()
+    def _make_seek_cb(self, secs: int):
+        async def callback(interaction: discord.Interaction) -> None:
+            gq = self.cog.queues.get(self.guild.id)
+            if err := _check_dj(interaction, gq):
+                await interaction.response.send_message(err, ephemeral=True)
+                return
+            if gq.current is None:
+                await interaction.response.send_message("Nothing is playing.", ephemeral=True)
+                return
+            target = min(secs, max(0, gq.current.duration - 1)) if gq.current.duration else secs
+            await interaction.response.defer()
+            await self.cog._restart_playback(self.guild, seek_seconds=target)
+            await asyncio.sleep(0.5)
+            self._rebuild_seek_bar()
+            await self._update_player()
+        return callback
 
     def _build_embed(self) -> discord.Embed:
         gq = self.cog.queues.get(self.guild.id)
@@ -415,7 +398,7 @@ class PlayerView(discord.ui.View):
         url = track.url if track.url and not track.url.startswith("ytsearch:") else None
         embed = discord.Embed(title=track.title, url=url, color=discord.Color.blurple())
         bar = progress_bar(elapsed, track.duration)
-        embed.description = f"\n{bar}\n\u2193 *Use the dropdown to seek* \u2193" if track.duration > 0 else f"\n{bar}\n"
+        embed.description = f"\n{bar}\n"
 
         if track.thumbnail:
             embed.set_thumbnail(url=track.thumbnail)
@@ -464,6 +447,7 @@ class PlayerView(discord.ui.View):
     async def _update_player(self) -> None:
         embed = self._build_embed()
         self._sync_pause_button()
+        self._rebuild_seek_bar()
         if self.message:
             try:
                 await self.message.edit(embed=embed, view=self)
