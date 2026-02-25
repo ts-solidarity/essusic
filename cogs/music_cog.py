@@ -297,6 +297,7 @@ class DJApprovalView(discord.ui.View):
         self.cog = cog
         self.guild = guild
         self.track = track
+        self.message: discord.Message | None = None
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -345,6 +346,11 @@ class DJApprovalView(discord.ui.View):
 
     async def on_timeout(self) -> None:
         self._disable_all()
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
 
 class PlayerView(discord.ui.View):
@@ -1297,7 +1303,7 @@ class MusicCog(commands.Cog):
                 channel = interaction.guild.get_channel(gq.text_channel_id)  # type: ignore[union-attr]
                 if channel and hasattr(channel, "send"):
                     view = DJApprovalView(self, interaction.guild, track)  # type: ignore[arg-type]
-                    await channel.send(  # type: ignore[union-attr]
+                    view.message = await channel.send(  # type: ignore[union-attr]
                         f"**DJ Approval Required:** {track.title} (requested by {track.requester})",
                         view=view,
                     )
