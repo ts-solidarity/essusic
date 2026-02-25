@@ -15,7 +15,7 @@ class InputType(Enum):
 
 
 _YOUTUBE_RE = re.compile(
-    r"(?:https?://)?(?:www\.|m\.)?(?:youtube\.com|youtu\.be)/?\S+"
+    r"(?:https?://)?(?:(?:www|m|music)\.)?(?:youtube\.com|youtu\.be)/?\S+"
 )
 
 _SPOTIFY_RE = re.compile(
@@ -60,7 +60,7 @@ def classify(query: str) -> tuple[InputType, str]:
         return InputType.RADIO_STREAM, query
 
     if _YOUTUBE_RE.match(query):
-        if "list=" in query:
+        if "list=" in query or "/browse/" in query:
             return InputType.YOUTUBE_PLAYLIST, query
         return InputType.YOUTUBE_URL, query
 
