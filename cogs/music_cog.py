@@ -43,6 +43,25 @@ from music.url_parser import InputType, classify
 log = logging.getLogger(__name__)
 
 
+_YT_JUNK_RE = re.compile(
+    r"\s*[\(\[]"
+    r"(?:official\s*(?:music\s*)?(?:video|audio|lyric\s*video|visualizer)?|"
+    r"lyrics?|hd|hq|4k|8k|remaster(?:ed)?|explicit|clean|radio\s*edit|"
+    r"full\s*(?:song|album)|feat\.?[^)\]]*|ft\.?[^)\]]*|prod\.?[^)\]]*|"
+    r"extended\s*(?:version|mix)?|original\s*(?:version|mix)?|topic)"
+    r"[\)\]]",
+    re.IGNORECASE,
+)
+_YT_TOPIC_RE = re.compile(r"\s*-\s*topic\s*$", re.IGNORECASE)
+
+
+def _clean_title(title: str) -> str:
+    """Strip common YouTube noise from track titles for lyrics search."""
+    title = _YT_TOPIC_RE.sub("", title)
+    title = _YT_JUNK_RE.sub("", title)
+    return title.strip(" -–—|")
+
+
 def format_duration(seconds: int) -> str:
     if seconds <= 0:
         return "LIVE"
@@ -590,12 +609,17 @@ class QueueView(discord.ui.View):
         super().__init__(timeout=120)
         self.gq = gq
         self.page = page
-        self.total_pages = max(1, math.ceil(len(gq.queue) / self.PER_PAGE))
         self._sync_buttons()
 
+    @property
+    def total_pages(self) -> int:
+        return max(1, math.ceil(len(self.gq.queue) / self.PER_PAGE))
+
     def _sync_buttons(self) -> None:
+        total = self.total_pages
+        self.page = max(0, min(self.page, total - 1))  # clamp in case queue shrank
         self.prev_btn.disabled = self.page <= 0
-        self.next_btn.disabled = self.page >= self.total_pages - 1
+        self.next_btn.disabled = self.page >= total - 1
 
     def build_embed(self) -> discord.Embed:
         gq = self.gq
@@ -618,9 +642,12 @@ class QueueView(discord.ui.View):
             f"Page {self.page + 1}/{self.total_pages}",
         ]
 
+        description = "\n".join(lines)
+        if len(description) > 4000:
+            description = description[:3990] + "\n…"
         embed = discord.Embed(
             title="Queue",
-            description="\n".join(lines),
+            description=description,
             color=discord.Color.blurple(),
         )
         embed.set_footer(text=" · ".join(footer_parts))
@@ -1763,6 +1790,9 @@ class MusicCog(commands.Cog):
         if vc is None or not vc.is_playing():
             await interaction.response.send_message("Nothing is playing.", ephemeral=True)
             return
+        if gq.current and gq.current.is_live:
+            await interaction.response.send_message("Cannot apply filters to a live stream.", ephemeral=True)
+            return
 
         gq.filter_name = name if name != "none" else None
         self.queues.save_settings()
@@ -1795,7 +1825,7 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("Invalid time format. Use `90`, `1:30`, or `1:30:00`.", ephemeral=True)
             return
 
-        if gq.current and gq.current.duration and secs >= gq.current.duration:
+        if gq.current and gq.current.duration and secs > gq.current.duration:
             await interaction.response.send_message("Seek position is past the end of the track.", ephemeral=True)
             return
 
@@ -1819,6 +1849,9 @@ class MusicCog(commands.Cog):
                 "Speed must be between 0.5 and 2.0.", ephemeral=True
             )
             return
+        if gq.current and gq.current.is_live:
+            await interaction.response.send_message("Cannot change speed on a live stream.", ephemeral=True)
+            return
 
         elapsed = self._get_elapsed(gq)
         gq.speed = rate
@@ -1838,6 +1871,9 @@ class MusicCog(commands.Cog):
         if vc is None or not vc.is_playing():
             await interaction.response.send_message("Nothing is playing.", ephemeral=True)
             return
+        if gq.current and gq.current.is_live:
+            await interaction.response.send_message("Cannot normalize a live stream.", ephemeral=True)
+            return
 
         elapsed = self._get_elapsed(gq)
         gq.normalize = not gq.normalize
@@ -1853,6 +1889,9 @@ class MusicCog(commands.Cog):
     @app_commands.command(name="lyrics", description="Show lyrics for the current or specified track")
     @app_commands.describe(query="Search query (defaults to current track)")
     async def lyrics(self, interaction: discord.Interaction, query: str | None = None) -> None:
+        # Resolve artist + clean title from current track, or parse the user query
+        artist = ""
+        search_title = query or ""
         if query is None:
             gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
             if gq.current is None:
@@ -1860,33 +1899,57 @@ class MusicCog(commands.Cog):
                     "Nothing is playing. Provide a search query.", ephemeral=True
                 )
                 return
-            query = gq.current.title
+            track = gq.current
+            artist = track.artist or ""
+            search_title = _clean_title(track.title)
+            # If title contains "Artist - Title" pattern, split it
+            if not artist and " - " in search_title:
+                parts = search_title.split(" - ", 1)
+                artist, search_title = parts[0].strip(), parts[1].strip()
 
         await interaction.response.defer()
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    "https://lrclib.net/api/search",
-                    params={"q": query},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    if resp.status != 200:
-                        await interaction.followup.send("Could not fetch lyrics.")
-                        return
-                    results = await resp.json()
+                hit = None
+
+                # Try exact-match endpoint first (much more accurate)
+                if artist and search_title:
+                    async with session.get(
+                        "https://lrclib.net/api/get",
+                        params={"track_name": search_title, "artist_name": artist},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data and (data.get("plainLyrics") or data.get("syncedLyrics")):
+                                hit = data
+
+                # Fall back to fuzzy search
+                if hit is None:
+                    q = f"{artist} {search_title}".strip() if artist else search_title
+                    async with session.get(
+                        "https://lrclib.net/api/search",
+                        params={"q": q},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        if resp.status != 200:
+                            await interaction.followup.send("Could not fetch lyrics.")
+                            return
+                        results = await resp.json()
+                        if results:
+                            hit = results[0]
         except Exception:
             await interaction.followup.send("Could not fetch lyrics.")
             return
 
-        if not results:
-            await interaction.followup.send(f"No lyrics found for **{query}**.")
+        if hit is None:
+            await interaction.followup.send(f"No lyrics found for **{search_title or query}**.")
             return
 
-        hit = results[0]
         text = hit.get("plainLyrics") or hit.get("syncedLyrics") or ""
         if not text:
-            await interaction.followup.send(f"No lyrics found for **{query}**.")
+            await interaction.followup.send(f"No lyrics found for **{search_title or query}**.")
             return
 
         title = hit.get("trackName", query)
