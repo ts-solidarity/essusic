@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import re
 from collections import Counter, deque
@@ -13,6 +14,18 @@ from .audio_source import TrackInfo
 log = logging.getLogger(__name__)
 
 _ARTIST_SEP_RE = re.compile(r"\s+[-–—|]\s+")
+
+
+def _atomic_write(path: Path, data: dict) -> None:
+    """Write JSON atomically using a temp file + rename to avoid corruption on crash."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, path)
+    except Exception as exc:
+        log.warning("Failed to save %s: %s", path, exc)
+        tmp.unlink(missing_ok=True)
 
 
 def _extract_artist(title: str) -> str:
@@ -71,7 +84,7 @@ class GuildQueue:
 
         # DJ queue mode
         self.dj_queue_mode: bool = False
-        self.pending_requests: deque[TrackInfo] = deque(maxlen=50)
+        self.pending_requests: deque[TrackInfo] = deque()
 
         # Crossfade
         self.crossfade_seconds: int = 0
@@ -248,11 +261,7 @@ class QueueManager:
             data = {k: getattr(gq, k) for k in _SETTINGS_KEYS}
             data["loop_mode"] = gq.loop_mode.name
             self._settings[str(guild_id)] = data
-        try:
-            self._settings_path.parent.mkdir(parents=True, exist_ok=True)
-            self._settings_path.write_text(json.dumps(self._settings, indent=2))
-        except Exception as exc:
-            log.warning("Failed to save settings: %s", exc)
+        _atomic_write(self._settings_path, self._settings)
 
     def get(self, guild_id: int) -> GuildQueue:
         if guild_id not in self._guilds:
@@ -301,11 +310,7 @@ class QueueManager:
             self._write_queue_state()
 
     def _write_queue_state(self) -> None:
-        try:
-            self._queue_state_path.parent.mkdir(parents=True, exist_ok=True)
-            self._queue_state_path.write_text(json.dumps(self._queue_state, indent=2))
-        except Exception as exc:
-            log.warning("Failed to save queue state: %s", exc)
+        _atomic_write(self._queue_state_path, self._queue_state)
 
     def _restore_queue_state(self, guild_id: int, gq: GuildQueue) -> None:
         """Restore saved queue into a freshly created GuildQueue."""
@@ -346,11 +351,7 @@ class HistoryManager:
                 log.warning("Failed to load history: %s", exc)
 
     def _save(self) -> None:
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps(self._data, indent=2))
-        except Exception as exc:
-            log.warning("Failed to save history: %s", exc)
+        _atomic_write(self._path, self._data)
 
     def record(
         self,
@@ -440,11 +441,7 @@ class FavoritesManager:
                 log.warning("Failed to load favorites: %s", exc)
 
     def _save(self) -> None:
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps(self._data, indent=2))
-        except Exception as exc:
-            log.warning("Failed to save favorites: %s", exc)
+        _atomic_write(self._path, self._data)
 
     def add(self, user_id: int, track: TrackInfo) -> bool:
         """Add a track. Returns False if already at max or duplicate."""
@@ -505,11 +502,7 @@ class PlaylistManager:
                 log.warning("Failed to load playlists: %s", exc)
 
     def _write(self) -> None:
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps(self._data, indent=2))
-        except Exception as exc:
-            log.warning("Failed to save playlists: %s", exc)
+        _atomic_write(self._path, self._data)
 
     def _get_playlist(self, guild_id: int, name: str) -> dict | None:
         guild_pls = self._data.get(str(guild_id), {})
@@ -663,11 +656,7 @@ class RatingsManager:
                 log.warning("Failed to load ratings: %s", exc)
 
     def _save(self) -> None:
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps(self._data, indent=2))
-        except Exception as exc:
-            log.warning("Failed to save ratings: %s", exc)
+        _atomic_write(self._path, self._data)
 
     def vote(
         self, guild_id: int, track_url: str, title: str,

@@ -126,9 +126,12 @@ class SearchView(discord.ui.View):
 
             if vc.is_playing() or vc.is_paused():
                 gq = self.cog.queues.get(interaction.guild.id)  # type: ignore[union-attr]
-                gq.current = None
+                # Prepend track and stop current — _play_next will pick it up immediately
                 gq.queue.appendleft(track)
-                vc.stop()  # triggers _play_next → pops our track from front
+                gq._restarting = True
+                vc.stop()
+                gq._restarting = False
+                await self.cog._play_next(interaction.guild)  # type: ignore[arg-type]
                 await interaction.followup.send(f"Now playing: **{track.title}**")
             else:
                 await self.cog._enqueue_and_play(interaction, track)
@@ -201,9 +204,9 @@ class VoteSkipView(discord.ui.View):
     @discord.ui.button(label="Skip (0/0)", style=discord.ButtonStyle.danger)
     async def vote(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.voters.add(interaction.user.id)
-        # Also record in the guild queue
+        # Sync a copy into the guild queue (don't share the same set object)
         gq = self.cog.queues.get(self.guild.id)
-        gq.skip_votes = self.voters
+        gq.skip_votes = set(self.voters)
 
         count = len(self.voters)
         button.label = f"Skip ({count}/{self.required})"
@@ -673,9 +676,11 @@ class MusicCog(commands.Cog):
     ) -> Optional[discord.VoiceClient]:
         """Join the user's voice channel if needed. Returns the VoiceClient or None on failure."""
         if not interaction.user.voice or not interaction.user.voice.channel:
-            await interaction.response.send_message(
-                "You need to be in a voice channel.", ephemeral=True
-            )
+            msg = "You need to be in a voice channel."
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
             return None
 
         channel = interaction.user.voice.channel
@@ -745,8 +750,11 @@ class MusicCog(commands.Cog):
                     if results:
                         tid, rec = results[0]
                         gq.radio_history.add(tid)
+                        # Keep history bounded; if it grows too large, drop the oldest
+                        # half so Spotify has more tracks to recommend from
                         if len(gq.radio_history) > 200:
-                            gq.radio_history = set(list(gq.radio_history)[-200:])
+                            items = list(gq.radio_history)
+                            gq.radio_history = set(items[100:])
                         gq.add(rec)
                         track = gq.next_track()
                         await self._notify_text_channel(
@@ -986,6 +994,13 @@ class MusicCog(commands.Cog):
 
         # DJ queue mode: non-DJs submit requests for approval
         if gq.dj_queue_mode and _check_dj(interaction, gq) is not None:
+            if len(gq.pending_requests) >= 50:
+                msg = "Too many pending requests. Please wait for the DJ to approve some first."
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+                return
             gq.pending_requests.append(track)
             msg = f"**{track.title}** submitted for DJ approval."
             if interaction.response.is_done():
