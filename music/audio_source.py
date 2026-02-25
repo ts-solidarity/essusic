@@ -24,8 +24,11 @@ YTDL_OPTIONS = {
 }
 
 FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn -ar 48000",
+    "before_options": (
+        "-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1"
+        " -reconnect_on_http_error 5xx -reconnect_delay_max 5"
+    ),
+    "options": "-vn -ar 48000 -bufsize 64k",
 }
 
 AUDIO_FILTERS: dict[str, str] = {
@@ -162,7 +165,10 @@ class YTDLSource(discord.PCMVolumeTransformer):
         opts = FFMPEG_OPTIONS["options"]
 
         if is_live:
-            before = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 10"
+            before = (
+                "-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1"
+                " -reconnect_on_http_error 5xx -reconnect_delay_max 10"
+            )
             seek_seconds = 0
         elif seek_seconds > 0:
             before = f"-ss {seek_seconds} " + before
