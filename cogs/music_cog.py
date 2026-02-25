@@ -138,6 +138,7 @@ class SearchView(discord.ui.View):
         async def callback(interaction: discord.Interaction) -> None:
             await interaction.response.defer()
             track.requester = interaction.user.display_name
+            track.requester_id = interaction.user.id
 
             vc = await self.cog._ensure_voice(interaction)
             if vc is None:
@@ -1168,7 +1169,22 @@ class MusicCog(commands.Cog):
             log.warning("Crossfade pre-fetch failed: %s", exc)
             return
 
+        # Re-validate state after the async fetch — vc may have stopped or
+        # the queue may have changed (user skipped, /stop, etc.)
+        if (
+            vc is None
+            or not vc.is_playing()
+            or not gq.queue
+            or gq.queue[0].url != next_track.url
+        ):
+            incoming.cleanup()
+            return
+
         outgoing = vc.source
+        if outgoing is None:
+            incoming.cleanup()
+            return
+
         xfade = CrossfadeSource(outgoing, incoming, gq.crossfade_seconds)
         xfade_vol = discord.PCMVolumeTransformer(xfade, volume=gq.volume)
 
