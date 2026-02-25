@@ -2982,9 +2982,13 @@ class MusicCog(commands.Cog):
         # Capture title now — gq.current can become None during the async Spotify fetch
         current_title = gq.current.title
         await interaction.response.defer()
-        results = await self.bot.loop.run_in_executor(
-            None, lambda: self.spotify.recommend_multiple(current_title, 5)
-        )
+        try:
+            results = await self.bot.loop.run_in_executor(
+                None, lambda: self.spotify.recommend_multiple(current_title, 5)
+            )
+        except Exception as exc:
+            log.warning("Similar tracks lookup failed: %s", exc)
+            results = []
         if not results:
             await interaction.followup.send("No similar tracks found.")
             return
@@ -3010,9 +3014,13 @@ class MusicCog(commands.Cog):
         gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
         gq.text_channel_id = interaction.channel_id
 
-        results = await self.bot.loop.run_in_executor(
-            None, lambda: self.spotify.recommend_by_seed(seed, set(), 5)
-        )
+        try:
+            results = await self.bot.loop.run_in_executor(
+                None, lambda: self.spotify.recommend_by_seed(seed, set(), 5)
+            )
+        except Exception as exc:
+            log.warning("Radio seed lookup failed: %s", exc)
+            results = []
         if not results:
             await interaction.followup.send(f"❌ No tracks found for **{seed}**.")
             return

@@ -63,92 +63,94 @@ class SpotifyResolver:
             )
         return tracks
 
-    def recommend(self, query: str) -> TrackInfo | None:
-        """Search Spotify for a track matching query, then return a recommendation."""
+    def _get_artist_id(self, query: str) -> str | None:
+        """Search for a track or artist and return an artist ID."""
         if not self._sp:
             return None
-        # Find a seed track
+        # Try track search first (works best for "Artist - Title" queries)
         results = self._sp.search(q=query, type="track", limit=1)
         items = results.get("tracks", {}).get("items", [])
-        if not items:
-            return None
-        seed_id = items[0]["id"]
-        # Get recommendations
-        recs = self._sp.recommendations(seed_tracks=[seed_id], limit=5)
-        rec_tracks = recs.get("tracks", [])
-        if not rec_tracks:
-            return None
-        # Pick first that isn't the seed
-        for track in rec_tracks:
-            if track["id"] != seed_id:
-                title = self._format_track(track)
-                return TrackInfo(
-                    title=title,
-                    url=f"ytsearch:{title}",
-                    duration=track.get("duration_ms", 0) // 1000,
-                )
+        if items:
+            return items[0]["artists"][0]["id"]
+        # Fall back to artist search
+        results = self._sp.search(q=query, type="artist", limit=1)
+        items = results.get("artists", {}).get("items", [])
+        if items:
+            return items[0]["id"]
         return None
 
+    def _related_top_tracks(
+        self, artist_id: str, exclude_ids: set[str], limit: int
+    ) -> list[tuple[str, TrackInfo]]:
+        """Get top tracks from related artists, skipping exclude_ids."""
+        try:
+            related = self._sp.artist_related_artists(artist_id)
+        except Exception as exc:
+            log.warning("Spotify related artists failed: %s", exc)
+            return []
+        out: list[tuple[str, TrackInfo]] = []
+        for artist in related.get("artists", []):
+            if len(out) >= limit:
+                break
+            try:
+                top = self._sp.artist_top_tracks(artist["id"])
+            except Exception:
+                continue
+            for track in top.get("tracks", []):
+                tid = track["id"]
+                if tid in exclude_ids:
+                    continue
+                exclude_ids.add(tid)
+                out.append((tid, self._track_to_info(track)))
+                if len(out) >= limit:
+                    break
+        return out
+
+    def recommend(self, query: str) -> TrackInfo | None:
+        """Find a similar track via related artists."""
+        if not self._sp:
+            return None
+        artist_id = self._get_artist_id(query)
+        if not artist_id:
+            return None
+        results = self._related_top_tracks(artist_id, set(), 1)
+        return results[0][1] if results else None
+
     def recommend_multiple(self, query: str, limit: int = 5) -> list[TrackInfo]:
-        """Search Spotify for a seed track, return multiple recommendations."""
+        """Find similar tracks via related artists."""
         if not self._sp:
             return []
-        results = self._sp.search(q=query, type="track", limit=1)
-        items = results.get("tracks", {}).get("items", [])
-        if not items:
+        artist_id = self._get_artist_id(query)
+        if not artist_id:
             return []
-        seed_id = items[0]["id"]
-        recs = self._sp.recommendations(seed_tracks=[seed_id], limit=limit)
-        out: list[TrackInfo] = []
-        for track in recs.get("tracks", []):
-            if track["id"] != seed_id:
-                out.append(self._track_to_info(track))
-        return out
+        results = self._related_top_tracks(artist_id, set(), limit)
+        return [info for _, info in results]
 
     def recommend_by_seed(
         self, seed: str, exclude_ids: set[str] | None = None, limit: int = 5
     ) -> list[tuple[str, TrackInfo]]:
-        """Get recommendations seeded by artist/genre/track name.
+        """Get similar tracks seeded by artist or track name.
 
         Returns list of (spotify_track_id, TrackInfo) for de-duplication.
-        Tries artist seed first, then genre, then track.
         """
         if not self._sp:
             return []
-        exclude_ids = exclude_ids or set()
+        exclude_ids = set(exclude_ids) if exclude_ids else set()
 
-        # Try to find an artist
-        artist_results = self._sp.search(q=seed, type="artist", limit=1)
-        artist_items = artist_results.get("artists", {}).get("items", [])
-
-        # Try to find a track as fallback
-        track_results = self._sp.search(q=seed, type="track", limit=1)
-        track_items = track_results.get("tracks", {}).get("items", [])
-
-        kwargs: dict = {"limit": limit + len(exclude_ids)}
-        if artist_items:
-            kwargs["seed_artists"] = [artist_items[0]["id"]]
-        elif track_items:
-            kwargs["seed_tracks"] = [track_items[0]["id"]]
+        # Try artist search first (best for radio seed like "Radiohead")
+        results = self._sp.search(q=seed, type="artist", limit=1)
+        items = results.get("artists", {}).get("items", [])
+        if items:
+            artist_id = items[0]["id"]
         else:
-            # Try as genre seed
-            kwargs["seed_genres"] = [seed.lower()]
+            # Fall back to track search → get artist from track
+            results = self._sp.search(q=seed, type="track", limit=1)
+            items = results.get("tracks", {}).get("items", [])
+            if not items:
+                return []
+            artist_id = items[0]["artists"][0]["id"]
 
-        try:
-            recs = self._sp.recommendations(**kwargs)
-        except Exception as exc:
-            log.warning("Spotify recommendations failed: %s", exc)
-            return []
-
-        out: list[tuple[str, TrackInfo]] = []
-        for track in recs.get("tracks", []):
-            tid = track["id"]
-            if tid in exclude_ids:
-                continue
-            out.append((tid, self._track_to_info(track)))
-            if len(out) >= limit:
-                break
-        return out
+        return self._related_top_tracks(artist_id, exclude_ids, limit)
 
     def resolve_track(self, track_id: str) -> list[str]:
         if not self._sp:
