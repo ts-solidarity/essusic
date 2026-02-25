@@ -208,6 +208,11 @@ class GuildQueue:
         self.radio_mode = False
         self.radio_seed = None
         self.radio_history.clear()
+        self.skip_votes.clear()
+        self.pending_requests.clear()
+        self.play_start_time = 0.0
+        self._restarting = False
+        self._undo_stack.clear()
 
     # ── Undo ──────────────────────────────────────────────────────────────
 

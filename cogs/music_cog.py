@@ -700,7 +700,10 @@ class MusicCog(commands.Cog):
             return
         vc: Optional[discord.VoiceClient] = guild.voice_client  # type: ignore[assignment]
         if vc and not vc.is_playing() and not vc.is_paused():
+            self._cancel_crossfade_timer(guild.id)
+            self._cleanup_player(guild.id)
             asyncio.run_coroutine_threadsafe(vc.disconnect(), self.bot.loop)
+            self.queues.clear_queue_state(guild.id)
             self.queues.remove(guild.id)
             asyncio.run_coroutine_threadsafe(
                 self._update_presence(None), self.bot.loop
