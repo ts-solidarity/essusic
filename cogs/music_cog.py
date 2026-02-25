@@ -478,7 +478,12 @@ class PlayerView(discord.ui.View):
                 await asyncio.sleep(10)
                 if self.message is None:
                     break
-                await self._update_player()
+                try:
+                    await self._update_player()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning("PlayerView auto-update failed: %s", exc)
         except asyncio.CancelledError:
             pass
 
