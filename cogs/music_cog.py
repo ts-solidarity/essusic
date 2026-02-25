@@ -2612,6 +2612,8 @@ class MusicCog(commands.Cog):
             count += 1
             fav_user_queued += 1
 
+        self.queues.save_queue_state(interaction.guild.id)  # type: ignore[union-attr]
+
         if not vc.is_playing() and not vc.is_paused():
             await self._play_next(interaction.guild)  # type: ignore[arg-type]
 
