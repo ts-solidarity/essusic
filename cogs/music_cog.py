@@ -867,6 +867,7 @@ class MusicCog(commands.Cog):
         self.ratings = RatingsManager()
         self._active_players: dict[int, PlayerView] = {}
         self._crossfade_timers: dict[int, asyncio.TimerHandle] = {}
+        self._playing_guilds: set[int] = set()  # guilds currently playing audio
 
     # ── helpers ──────────────────────────────────────────────────────────
 
@@ -995,7 +996,9 @@ class MusicCog(commands.Cog):
                     log.warning("Autoplay recommendation failed: %s", exc)
 
             if track is None:
-                metric_active_players.dec()
+                if guild.id in self._playing_guilds:
+                    self._playing_guilds.discard(guild.id)
+                    metric_active_players.dec()
                 self.queues.save_queue_state(guild.id)
                 await self._update_presence(None)
                 if not gq.stay_connected:
@@ -1025,7 +1028,9 @@ class MusicCog(commands.Cog):
             return
 
         tracks_played_total.inc()
-        metric_active_players.inc()
+        if guild.id not in self._playing_guilds:
+            self._playing_guilds.add(guild.id)
+            metric_active_players.inc()
         metric_queue_size.labels(guild_id=str(guild.id)).set(len(gq.queue))
         gq.play_start_time = time.time()
         self.history.record(
@@ -1389,9 +1394,20 @@ class MusicCog(commands.Cog):
 
         count = 0
         skipped = 0
+        skip_reason = "queue full"
+        user_id = interaction.user.id
+        user_name = interaction.user.display_name
+        user_queued = sum(
+            1 for t in gq.queue
+            if t.requester_id == user_id or (t.requester_id == 0 and t.requester == user_name)
+        )
         for entry in entries:
             if entry is None:
                 continue
+            if gq.max_per_user > 0 and user_queued >= gq.max_per_user:
+                skipped = total_entries - count
+                skip_reason = f"per-user limit of {gq.max_per_user}"
+                break
             entry_url = entry.get("webpage_url") or entry.get("url", "")
             if not entry_url:
                 video_id = entry.get("id", "")
@@ -1402,12 +1418,14 @@ class MusicCog(commands.Cog):
                 url=entry_url,
                 duration=int(entry.get("duration", 0) or 0),
                 thumbnail=entry.get("thumbnail", ""),
-                requester=interaction.user.display_name,
+                requester=user_name,
+                requester_id=user_id,
             )
             if gq.add(track) is None:
                 skipped = total_entries - count
                 break
             count += 1
+            user_queued += 1
             if progress_msg and count % 5 == 0:
                 try:
                     await progress_msg.edit(content=f"Loading... ({count}/{total_entries} queued)")
@@ -1422,7 +1440,7 @@ class MusicCog(commands.Cog):
         playlist_title = data.get("title", "YouTube playlist")
         msg = f"Queued **{count} tracks** from **{playlist_title}**."
         if skipped:
-            msg += f" ({skipped} skipped — queue full)"
+            msg += f" ({skipped} skipped — {skip_reason})"
         if progress_msg:
             try:
                 await progress_msg.edit(content=msg)
@@ -1513,15 +1531,27 @@ class MusicCog(commands.Cog):
                 )
 
             count = 0
+            sp_skip_reason = "queue full"
+            sp_user_id = interaction.user.id
+            sp_user_name = interaction.user.display_name
+            sp_user_queued = sum(
+                1 for t in gq.queue
+                if t.requester_id == sp_user_id or (t.requester_id == 0 and t.requester == sp_user_name)
+            )
             for s in search_strings:
+                if gq.max_per_user > 0 and sp_user_queued >= gq.max_per_user:
+                    sp_skip_reason = f"per-user limit of {gq.max_per_user}"
+                    break
                 track = TrackInfo(
                     title=s,
                     url=f"ytsearch:{s}",
-                    requester=interaction.user.display_name,
+                    requester=sp_user_name,
+                    requester_id=sp_user_id,
                 )
                 if gq.add(track) is None:
                     break
                 count += 1
+                sp_user_queued += 1
                 if progress_msg and count % 5 == 0:
                     try:
                         await progress_msg.edit(content=f"Loading... ({count}/{total} queued)")
@@ -1535,7 +1565,7 @@ class MusicCog(commands.Cog):
 
             msg = f"Queued **{count} track{'s' if count != 1 else ''}** from Spotify."
             if count < len(search_strings):
-                msg += f" ({len(search_strings) - count} skipped — queue full)"
+                msg += f" ({len(search_strings) - count} skipped — {sp_skip_reason})"
             if progress_msg:
                 try:
                     await progress_msg.edit(content=msg)
@@ -1658,7 +1688,9 @@ class MusicCog(commands.Cog):
         vc.stop()
         await vc.disconnect()
         metric_voice_connections.dec()
-        metric_active_players.dec()
+        if interaction.guild.id in self._playing_guilds:  # type: ignore[union-attr]
+            self._playing_guilds.discard(interaction.guild.id)  # type: ignore[union-attr]
+            metric_active_players.dec()
         self.queues.remove(interaction.guild.id)  # type: ignore[union-attr]
         await self._update_presence(None)
         await interaction.response.send_message("⏹️ Stopped and disconnected.")
@@ -2549,17 +2581,27 @@ class MusicCog(commands.Cog):
 
         gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
         count = 0
+        fav_skip_reason = "queue full"
+        fav_user_id = interaction.user.id
+        fav_user_queued = sum(
+            1 for t in gq.queue
+            if t.requester_id == fav_user_id or (t.requester_id == 0 and t.requester == interaction.user.display_name)
+        )
         for track in tracks:
+            if gq.max_per_user > 0 and fav_user_queued >= gq.max_per_user:
+                fav_skip_reason = f"per-user limit of {gq.max_per_user}"
+                break
             if gq.add(track) is None:
                 break
             count += 1
+            fav_user_queued += 1
 
         if not vc.is_playing() and not vc.is_paused():
             await self._play_next(interaction.guild)  # type: ignore[arg-type]
 
         msg = f"Queued **{count}** favorite{'s' if count != 1 else ''}."
         if count < len(tracks):
-            msg += f" ({len(tracks) - count} skipped — queue full)"
+            msg += f" ({len(tracks) - count} skipped — {fav_skip_reason})"
         if interaction.response.is_done():
             await interaction.followup.send(msg)
         else:
@@ -2646,11 +2688,22 @@ class MusicCog(commands.Cog):
 
         gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
         count = 0
+        pl_skip_reason = "queue full"
+        pl_user_id = interaction.user.id
+        pl_user_queued = sum(
+            1 for t in gq.queue
+            if t.requester_id == pl_user_id or (t.requester_id == 0 and t.requester == interaction.user.display_name)
+        )
         for track in tracks:
+            if gq.max_per_user > 0 and pl_user_queued >= gq.max_per_user:
+                pl_skip_reason = f"per-user limit of {gq.max_per_user}"
+                break
             track.requester = interaction.user.display_name
+            track.requester_id = pl_user_id
             if gq.add(track) is None:
                 break
             count += 1
+            pl_user_queued += 1
 
         self.queues.save_queue_state(interaction.guild.id)  # type: ignore[union-attr]
 
@@ -2659,7 +2712,7 @@ class MusicCog(commands.Cog):
 
         msg = f"Queued **{count}** track{'s' if count != 1 else ''} from **{name}**."
         if count < len(tracks):
-            msg += f" ({len(tracks) - count} skipped — queue full)"
+            msg += f" ({len(tracks) - count} skipped — {pl_skip_reason})"
         if interaction.response.is_done():
             await interaction.followup.send(msg)
         else:
@@ -2974,17 +3027,27 @@ class MusicCog(commands.Cog):
         gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
         gq.text_channel_id = interaction.channel_id
         count = 0
+        imp_skip_reason = "queue full"
+        imp_user_id = interaction.user.id
+        imp_user_queued = sum(
+            1 for t in gq.queue
+            if t.requester_id == imp_user_id or (t.requester_id == 0 and t.requester == interaction.user.display_name)
+        )
         for item in items:
+            if gq.max_per_user > 0 and imp_user_queued >= gq.max_per_user:
+                imp_skip_reason = f"per-user limit of {gq.max_per_user}"
+                break
             track = TrackInfo(
                 title=item.get("t", "Unknown"),
                 url=item.get("u", ""),
                 duration=item.get("d", 0),
                 requester=interaction.user.display_name,
-                requester_id=interaction.user.id,
+                requester_id=imp_user_id,
             )
             if gq.add(track) is None:
                 break
             count += 1
+            imp_user_queued += 1
 
         self.queues.save_queue_state(interaction.guild.id)  # type: ignore[union-attr]
         if not vc.is_playing() and not vc.is_paused():
@@ -2992,7 +3055,7 @@ class MusicCog(commands.Cog):
 
         msg = f"Imported **{count}** track{'s' if count != 1 else ''}."
         if count < len(items):
-            msg += f" ({len(items) - count} skipped — queue full)"
+            msg += f" ({len(items) - count} skipped — {imp_skip_reason})"
         if interaction.response.is_done():
             await interaction.followup.send(msg)
         else:
@@ -3218,7 +3281,9 @@ class MusicCog(commands.Cog):
             vc.stop()
             await vc.disconnect()
             metric_voice_connections.dec()
-            metric_active_players.dec()
+            if member.guild.id in self._playing_guilds:
+                self._playing_guilds.discard(member.guild.id)
+                metric_active_players.dec()
             self.queues.remove(member.guild.id)
             await self._update_presence(None)
 
