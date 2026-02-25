@@ -1084,24 +1084,46 @@ class MusicCog(commands.Cog):
             if old._update_task and not old._update_task.done():
                 old._update_task.cancel()
             old.stop()
-            # Delete old message to avoid clutter
-            if old.message:
+
+        if gq.current is None or gq.text_channel_id is None:
+            if old and old.message:
                 try:
                     await old.message.delete()
                 except discord.HTTPException:
                     pass
-
-        if gq.current is None or gq.text_channel_id is None:
             return
 
         channel = guild.get_channel(gq.text_channel_id)
         if channel is None or not hasattr(channel, "send"):
+            if old and old.message:
+                try:
+                    await old.message.delete()
+                except discord.HTTPException:
+                    pass
             return
 
         view = PlayerView(self, guild)
         self._active_players[guild.id] = view
         embed = view._build_embed()
         view._sync_pause_button()
+
+        # Edit the existing message in-place to avoid a new notification
+        if old and old.message and old.message.channel.id == gq.text_channel_id:
+            try:
+                await old.message.edit(embed=embed, view=view)
+                view.message = old.message
+                view._update_task = asyncio.create_task(view._auto_update())
+                return
+            except discord.HTTPException:
+                pass  # message gone — fall through to send new
+
+        # Different channel or no previous message — delete old and send new
+        if old and old.message:
+            try:
+                await old.message.delete()
+            except discord.HTTPException:
+                pass
+
         try:
             msg = await channel.send(embed=embed, view=view)  # type: ignore[union-attr]
             view.message = msg
