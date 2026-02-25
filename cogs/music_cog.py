@@ -1837,7 +1837,7 @@ class MusicCog(commands.Cog):
             embed.add_field(name="⏭️ Up next", value=next_track.title[:100], inline=False)
         if track.thumbnail:
             embed.set_thumbnail(url=track.thumbnail)
-        if track.url:
+        if track.url and not track.url.startswith("ytsearch:"):
             embed.url = track.url
         embed.set_footer(text=status)
 
