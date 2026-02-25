@@ -728,7 +728,7 @@ class MusicCog(commands.Cog):
                 except discord.HTTPException:
                     pass
 
-    async def _play_next(self, guild: discord.Guild) -> None:
+    async def _play_next(self, guild: discord.Guild, _fail_count: int = 0) -> None:
         gq = self.queues.get(guild.id)
         vc: Optional[discord.VoiceClient] = guild.voice_client  # type: ignore[assignment]
         if vc is None:
@@ -803,7 +803,12 @@ class MusicCog(commands.Cog):
             await self._notify_text_channel(
                 guild, f"Failed to play **{track.title}**, skipping..."
             )
-            await self._play_next(guild)
+            if _fail_count >= 10:
+                await self._notify_text_channel(
+                    guild, "Too many consecutive playback failures. Stopping."
+                )
+                return
+            await self._play_next(guild, _fail_count + 1)
             return
 
         tracks_played_total.inc()
@@ -1543,13 +1548,13 @@ class MusicCog(commands.Cog):
         if err := _check_dj(interaction, gq):
             await interaction.response.send_message(err, ephemeral=True)
             return
-        gq.snapshot(f"Removed #{position}")
-        removed = gq.remove_at(position - 1)
-        if removed is None:
+        if position < 1 or position > len(gq.queue):
             await interaction.response.send_message(
                 f"Invalid position. Queue has {len(gq.queue)} tracks.", ephemeral=True
             )
             return
+        gq.snapshot(f"Removed #{position}")
+        removed = gq.remove_at(position - 1)
         self.queues.save_queue_state(interaction.guild.id)  # type: ignore[union-attr]
         await interaction.response.send_message(f"Removed **{removed.title}** from the queue.")
 
@@ -1586,13 +1591,13 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("Not connected.", ephemeral=True)
             return
 
-        gq.snapshot(f"Skip to #{position}")
-        target = gq.skip_to(position - 1)
-        if target is None:
+        if position < 1 or position > len(gq.queue):
             await interaction.response.send_message(
                 f"Invalid position. Queue has {len(gq.queue)} tracks.", ephemeral=True
             )
             return
+        gq.snapshot(f"Skip to #{position}")
+        target = gq.skip_to(position - 1)
 
         gq.current = None
         self.queues.save_queue_state(interaction.guild.id)  # type: ignore[union-attr]
@@ -1897,15 +1902,22 @@ class MusicCog(commands.Cog):
             await interaction.followup.send(embed=embed)
         else:
             # Paginate into multiple embeds
+            # First page has header prepended; subtract its length from the limit
+            header_overhead = len(header) + 2  # +2 for "\n\n"
+            first_limit = 4096 - header_overhead
+            chunk_limit = 4096
+
             chunks: list[str] = []
+            first = True
             while text:
-                cut = text[:4000]
-                # Try to break at a newline
+                limit = first_limit if first else chunk_limit
+                cut = text[:limit]
                 nl = cut.rfind("\n")
-                if nl > 2000:
+                if nl > limit // 2:
                     cut = text[:nl]
                 chunks.append(cut)
                 text = text[len(cut):].lstrip("\n")
+                first = False
 
             for i, chunk in enumerate(chunks):
                 embed = discord.Embed(
@@ -2113,7 +2125,7 @@ class MusicCog(commands.Cog):
             return
         err = self.playlists.save(
             interaction.guild.id, name, tracks,  # type: ignore[union-attr]
-            created_by=interaction.user.display_name,
+            created_by=str(interaction.user.id),
         )
         if err:
             await interaction.response.send_message(err, ephemeral=True)
@@ -2165,7 +2177,13 @@ class MusicCog(commands.Cog):
         lines: list[str] = []
         for pl in playlists:
             count = len(pl.get("tracks", []))
-            lines.append(f"**{pl['name']}** — {count} track{'s' if count != 1 else ''} (by {pl.get('created_by', '?')})")
+            creator_raw = pl.get("created_by", "?")
+            # created_by is stored as user ID string; try to resolve to a name
+            creator_display = creator_raw
+            if creator_raw.isdigit():
+                member = interaction.guild.get_member(int(creator_raw))  # type: ignore[union-attr]
+                creator_display = member.display_name if member else f"<@{creator_raw}>"
+            lines.append(f"**{pl['name']}** — {count} track{'s' if count != 1 else ''} (by {creator_display})")
         embed = discord.Embed(
             title="Saved Playlists",
             description="\n".join(lines),
@@ -2177,14 +2195,22 @@ class MusicCog(commands.Cog):
     @app_commands.describe(name="Playlist name")
     @app_commands.autocomplete(name=_playlist_name_autocomplete)
     async def playlist_delete(self, interaction: discord.Interaction, name: str) -> None:
-        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
-        if err := _check_dj(interaction, gq):
-            await interaction.response.send_message(err, ephemeral=True)
-            return
-        if self.playlists.delete(interaction.guild.id, name):  # type: ignore[union-attr]
-            await interaction.response.send_message(f"Deleted playlist **{name}**.")
-        else:
+        guild_id = interaction.guild.id  # type: ignore[union-attr]
+        creator = self.playlists.get_creator(guild_id, name)
+        if creator is None:
             await interaction.response.send_message(f"Playlist **{name}** not found.", ephemeral=True)
+            return
+        is_admin = interaction.user.guild_permissions.administrator  # type: ignore[union-attr]
+        is_creator = creator == str(interaction.user.id)
+        gq = self.queues.get(guild_id)
+        is_dj = _check_dj(interaction, gq) is None
+        if not is_creator and not is_admin and not is_dj:
+            await interaction.response.send_message(
+                "Only the playlist creator, a DJ, or an admin can delete playlists.", ephemeral=True
+            )
+            return
+        self.playlists.delete(guild_id, name)
+        await interaction.response.send_message(f"Deleted playlist **{name}**.")
 
     # ── collaborative playlists ──────────────────────────────────────────
 
@@ -2201,7 +2227,7 @@ class MusicCog(commands.Cog):
             return
         # Only creator or DJ can add collaborators
         gq = self.queues.get(guild_id)
-        if creator != interaction.user.display_name and _check_dj(interaction, gq) is not None:
+        if creator != str(interaction.user.id) and _check_dj(interaction, gq) is not None:
             await interaction.response.send_message("Only the playlist creator or a DJ can add collaborators.", ephemeral=True)
             return
         if self.playlists.add_collaborator(guild_id, name, user.id):
@@ -2221,7 +2247,7 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message(f"Playlist **{name}** not found.", ephemeral=True)
             return
         gq = self.queues.get(guild_id)
-        if creator != interaction.user.display_name and _check_dj(interaction, gq) is not None:
+        if creator != str(interaction.user.id) and _check_dj(interaction, gq) is not None:
             await interaction.response.send_message("Only the playlist creator or a DJ can remove collaborators.", ephemeral=True)
             return
         if self.playlists.remove_collaborator(guild_id, name, user.id):
@@ -2242,7 +2268,7 @@ class MusicCog(commands.Cog):
         if creator is None:
             await interaction.response.send_message(f"Playlist **{name}** not found.", ephemeral=True)
             return
-        is_creator = creator == interaction.user.display_name
+        is_creator = creator == str(interaction.user.id)
         is_collab = self.playlists.is_collaborator(guild_id, name, interaction.user.id)
         if not is_creator and not is_collab:
             await interaction.response.send_message("You must be the creator or a collaborator.", ephemeral=True)
@@ -2264,7 +2290,7 @@ class MusicCog(commands.Cog):
         if creator is None:
             await interaction.response.send_message(f"Playlist **{name}** not found.", ephemeral=True)
             return
-        is_creator = creator == interaction.user.display_name
+        is_creator = creator == str(interaction.user.id)
         is_collab = self.playlists.is_collaborator(guild_id, name, interaction.user.id)
         if not is_creator and not is_collab:
             await interaction.response.send_message("You must be the creator or a collaborator.", ephemeral=True)

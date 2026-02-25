@@ -280,6 +280,12 @@ class QueueManager:
                                 gq.loop_mode = LoopMode[saved[k]]
                             except KeyError:
                                 pass
+                        elif k == "eq_bands":
+                            bands = saved[k]
+                            if isinstance(bands, list):
+                                # Ensure exactly 10 elements regardless of stored length
+                                bands = (bands + [0.0] * 10)[:10]
+                                gq.eq_bands = [float(b) for b in bands]
                         else:
                             setattr(gq, k, saved[k])
             self._restore_queue_state(guild_id, gq)
