@@ -2618,6 +2618,7 @@ class MusicCog(commands.Cog):
             return
 
         gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        gq.text_channel_id = interaction.channel_id
         count = 0
         fav_skip_reason = "queue full"
         fav_user_id = interaction.user.id
@@ -2727,6 +2728,7 @@ class MusicCog(commands.Cog):
             return
 
         gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        gq.text_channel_id = interaction.channel_id
         count = 0
         pl_skip_reason = "queue full"
         pl_user_id = interaction.user.id
