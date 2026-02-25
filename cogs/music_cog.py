@@ -2053,6 +2053,12 @@ class MusicCog(commands.Cog):
         if err := _check_dj(interaction, gq):
             await interaction.response.send_message(err, ephemeral=True)
             return
+        n = len(gq.queue)
+        if from_pos < 1 or from_pos > n or to_pos < 1 or to_pos > n:
+            await interaction.response.send_message(
+                f"❌ Invalid position. The queue has {n} tracks.", ephemeral=True
+            )
+            return
         if from_pos == to_pos:
             await interaction.response.send_message("Track is already at that position.", ephemeral=True)
             return
