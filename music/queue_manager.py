@@ -220,6 +220,7 @@ class GuildQueue:
         self.play_start_time = 0.0
         self._restarting = False
         self._undo_stack.clear()
+        self.np_message_id = None  # runtime-only, reset when queue is cleared
 
     # ── Undo ──────────────────────────────────────────────────────────────
 
@@ -493,8 +494,15 @@ class FavoritesManager:
         return self._data.get(str(user_id), [])
 
     def list_for_guild(self, user_id: int, guild_id: int) -> list[dict]:
-        """Return only favorites saved from a specific guild."""
-        return [f for f in self.list(user_id) if f.get("guild_id") == guild_id]
+        """Return favorites from a specific guild.
+
+        Entries saved before guild tagging (no 'guild_id' key, or guild_id=0)
+        are treated as universal and shown in all guilds for backward compatibility.
+        """
+        return [
+            f for f in self.list(user_id)
+            if f.get("guild_id", 0) in (0, guild_id)
+        ]
 
     def as_tracks(self, user_id: int, requester: str = "") -> list[TrackInfo]:
         return [

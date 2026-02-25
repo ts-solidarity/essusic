@@ -219,6 +219,7 @@ class VoteSkipView(discord.ui.View):
         self.guild = guild
         self.required = required
         self.voters: set[int] = set()
+        self.message: discord.Message | None = None
 
     @discord.ui.button(label="Skip (0/0)", style=discord.ButtonStyle.danger)
     async def vote(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -236,6 +237,7 @@ class VoteSkipView(discord.ui.View):
                 content=f"Vote skip passed ({count}/{self.required})! Skipping...",
                 view=self,
             )
+            self.stop()
             vc: Optional[discord.VoiceClient] = self.guild.voice_client  # type: ignore[assignment]
             if vc and vc.is_playing():
                 vc.stop()
@@ -245,6 +247,11 @@ class VoteSkipView(discord.ui.View):
     async def on_timeout(self) -> None:
         for item in self.children:
             item.disabled = True  # type: ignore[union-attr]
+        if self.message:
+            try:
+                await self.message.edit(content="Vote skip expired.", view=self)
+            except discord.HTTPException:
+                pass
 
 
 class RateView(discord.ui.View):
@@ -1088,13 +1095,13 @@ class MusicCog(commands.Cog):
         if not gq.np_channel_id or gq.current is None:
             return
         channel = guild.get_channel(gq.np_channel_id)
-        if channel is None or not hasattr(channel, "send"):
+        if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             return
 
         track = gq.current
         embed = discord.Embed(
             title=track.title,
-            url=track.url if track.url.startswith("http") else discord.utils.MISSING,
+            url=track.url if track.url.startswith("http") else None,
             color=discord.Color.blurple(),
         )
         if track.thumbnail:
@@ -1932,6 +1939,11 @@ class MusicCog(commands.Cog):
                 "You need the **Manage Channels** permission to use this.", ephemeral=True
             )
             return
+        if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
+            await interaction.response.send_message(
+                "❌ This must be used in a text channel.", ephemeral=True
+            )
+            return
         gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
         gq.np_channel_id = interaction.channel_id
         gq.np_message_id = None
@@ -2421,10 +2433,11 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("Vote skip passed! Skipping...")
             return
 
-        await interaction.response.send_message(
+        msg = await interaction.response.send_message(
             f"Vote to skip — **1/{required}** votes. Click below to vote!",
             view=view,
         )
+        view.message = await interaction.original_response()
 
     # ── history / top ────────────────────────────────────────────────────
 
