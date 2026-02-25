@@ -95,6 +95,13 @@ class GuildQueue:
         # Locale
         self.locale: str = "en"
 
+        # Now-playing channel (persisted: np_channel_id; runtime: np_message_id)
+        self.np_channel_id: int | None = None
+        self.np_message_id: int | None = None  # not persisted
+
+        # Per-user queue limit (0 = unlimited)
+        self.max_per_user: int = 0
+
     def add(self, track: TrackInfo) -> int | None:
         """Add a track and return its position (1-indexed), or None if queue is full."""
         if len(self.queue) >= self.max_queue:
@@ -234,7 +241,7 @@ class GuildQueue:
 _SETTINGS_KEYS = (
     "volume", "search_mode", "max_queue", "autoplay", "filter_name",
     "dj_role_id", "stay_connected", "speed", "normalize", "loop_mode",
-    "eq_bands", "crossfade_seconds", "locale",
+    "eq_bands", "crossfade_seconds", "locale", "np_channel_id", "max_per_user",
 )
 
 
@@ -454,7 +461,7 @@ class FavoritesManager:
     def _save(self) -> None:
         _atomic_write(self._path, self._data)
 
-    def add(self, user_id: int, track: TrackInfo) -> bool:
+    def add(self, user_id: int, track: TrackInfo, guild_id: int = 0) -> bool:
         """Add a track. Returns False if already at max or duplicate."""
         key = str(user_id)
         favs = self._data.setdefault(key, [])
@@ -467,6 +474,7 @@ class FavoritesManager:
             "url": track.url,
             "duration": track.duration,
             "thumbnail": track.thumbnail,
+            "guild_id": guild_id,
         })
         self._save()
         return True
@@ -484,6 +492,10 @@ class FavoritesManager:
     def list(self, user_id: int) -> list[dict]:
         return self._data.get(str(user_id), [])
 
+    def list_for_guild(self, user_id: int, guild_id: int) -> list[dict]:
+        """Return only favorites saved from a specific guild."""
+        return [f for f in self.list(user_id) if f.get("guild_id") == guild_id]
+
     def as_tracks(self, user_id: int, requester: str = "") -> list[TrackInfo]:
         return [
             TrackInfo(
@@ -494,6 +506,21 @@ class FavoritesManager:
                 requester=requester,
             )
             for f in self.list(user_id)
+        ]
+
+    def as_tracks_for_guild(
+        self, user_id: int, guild_id: int, requester: str = ""
+    ) -> list[TrackInfo]:
+        """Return favorites from a specific guild as playable TrackInfo objects."""
+        return [
+            TrackInfo(
+                title=f["title"],
+                url=f["url"],
+                duration=f.get("duration", 0),
+                thumbnail=f.get("thumbnail", ""),
+                requester=requester,
+            )
+            for f in self.list_for_guild(user_id, guild_id)
         ]
 
 

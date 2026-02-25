@@ -679,6 +679,7 @@ _HELP_CATEGORIES: list[tuple[str, str, list[tuple[str, str]]]] = [
         "playback",
         [
             ("/play", "Play from a YouTube/Spotify URL or search keywords"),
+            ("/playnext", "Insert a single track to play immediately after the current one"),
             ("/skip", "Skip the current track and play the next one"),
             ("/stop", "Stop playback, clear queue, and disconnect"),
             ("/pause", "Pause playback"),
@@ -693,6 +694,7 @@ _HELP_CATEGORIES: list[tuple[str, str, list[tuple[str, str]]]] = [
         "queue",
         [
             ("/queue", "Show the current queue"),
+            ("/myqueue", "Show only the tracks you have in the queue"),
             ("/remove `<pos>`", "Remove a track by position"),
             ("/move `<from>` `<to>`", "Move a track to a different position"),
             ("/skipto `<pos>`", "Jump to a specific position in the queue"),
@@ -708,8 +710,8 @@ _HELP_CATEGORIES: list[tuple[str, str, list[tuple[str, str]]]] = [
         "audio",
         [
             ("/volume `<1-100>`", "Adjust playback volume"),
-            ("/filter", "Apply an audio filter (Bass Boost, Nightcore, Vaporwave, 8D)"),
-            ("/seek `<time>`", "Seek to a position, e.g. `1:30` or `90`"),
+            ("/filter", "Apply an audio filter (Bass Boost, Nightcore, Vaporwave, 8D, Karaoke)"),
+            ("/seek `<time>`", "Seek to a position — absolute (`1:30`) or relative (`+30`, `-15`)"),
             ("/speed `<0.5-2.0>`", "Set playback speed"),
             ("/normalize", "Toggle loudness normalization to balance volume differences"),
             ("/eq", "Apply an EQ preset (Flat, Bass Heavy, Treble Heavy, Vocal, Electronic)"),
@@ -782,6 +784,9 @@ _HELP_CATEGORIES: list[tuple[str, str, list[tuple[str, str]]]] = [
         "settings",
         [
             ("/maxqueue `<size>`", "Set the maximum queue size (default 50)"),
+            ("/maxperuser `<limit>`", "Limit how many tracks each user can have in the queue"),
+            ("/setnpchannel", "Set this channel as the now-playing display channel"),
+            ("/clearnpchannel", "Disable the dedicated now-playing channel"),
             ("/dj `<role>`", "Restrict bot controls to a DJ role (admin only)"),
             ("/djclear", "Remove the DJ role restriction (admin only)"),
             ("/djmode", "Require DJ approval before non-DJs can add tracks (admin only)"),
@@ -1042,6 +1047,9 @@ class MusicCog(commands.Cog):
         # Auto-send/refresh the player view in the text channel
         await self._send_player(guild, gq)
 
+        # Update dedicated now-playing channel if set
+        await self._update_np_channel(guild, gq)
+
     async def _send_player(self, guild: discord.Guild, gq: GuildQueue) -> None:
         """Send or refresh the interactive PlayerView in the text channel."""
         # Clean up the old player
@@ -1074,6 +1082,45 @@ class MusicCog(commands.Cog):
             view._update_task = asyncio.create_task(view._auto_update())
         except discord.HTTPException:
             self._active_players.pop(guild.id, None)
+
+    async def _update_np_channel(self, guild: discord.Guild, gq: GuildQueue) -> None:
+        """Post or edit a now-playing embed in the dedicated NP channel."""
+        if not gq.np_channel_id or gq.current is None:
+            return
+        channel = guild.get_channel(gq.np_channel_id)
+        if channel is None or not hasattr(channel, "send"):
+            return
+
+        track = gq.current
+        embed = discord.Embed(
+            title=track.title,
+            url=track.url if track.url.startswith("http") else discord.utils.MISSING,
+            color=discord.Color.blurple(),
+        )
+        if track.thumbnail:
+            embed.set_thumbnail(url=track.thumbnail)
+        embed.add_field(name="👤 Requested by", value=track.requester or "Unknown")
+        embed.add_field(name="⏱️ Duration", value=format_duration(track.duration))
+        if gq.queue:
+            embed.add_field(name="⏭️ Up next", value=gq.queue[0].title, inline=False)
+        remaining = len(gq.queue)
+        embed.set_footer(text=f"🎵 {remaining} track{'s' if remaining != 1 else ''} remaining")
+
+        # Try to edit existing message first
+        if gq.np_message_id:
+            try:
+                msg = await channel.fetch_message(gq.np_message_id)  # type: ignore[union-attr]
+                await msg.edit(embed=embed)
+                return
+            except discord.HTTPException:
+                gq.np_message_id = None
+
+        # Post a new message
+        try:
+            msg = await channel.send(embed=embed)  # type: ignore[union-attr]
+            gq.np_message_id = msg.id
+        except discord.HTTPException:
+            pass
 
     async def _update_presence(self, track: TrackInfo | None) -> None:
         if track:
@@ -1192,7 +1239,7 @@ class MusicCog(commands.Cog):
         gq._restarting = False
 
     async def _enqueue_and_play(
-        self, interaction: discord.Interaction, track: TrackInfo
+        self, interaction: discord.Interaction, track: TrackInfo, *, play_next: bool = False
     ) -> None:
         vc = await self._ensure_voice(interaction)
         if vc is None:
@@ -1225,6 +1272,43 @@ class MusicCog(commands.Cog):
                         f"**DJ Approval Required:** {track.title} (requested by {track.requester})",
                         view=view,
                     )
+            return
+
+        # Per-user queue limit
+        if gq.max_per_user > 0:
+            user_count = sum(
+                1 for t in gq.queue
+                if t.requester_id == interaction.user.id
+                or (t.requester_id == 0 and t.requester == interaction.user.display_name)
+            )
+            if user_count >= gq.max_per_user:
+                s = "s" if user_count != 1 else ""
+                msg = (
+                    f"You already have **{user_count}** track{s} in the queue "
+                    f"(max **{gq.max_per_user}** per user)."
+                )
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+                return
+
+        # play_next: insert at front of queue when something is already playing
+        if play_next and (vc.is_playing() or vc.is_paused()):
+            if len(gq.queue) >= gq.max_queue:
+                msg = f"Queue is full ({gq.max_queue} tracks max)."
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
+                return
+            gq.queue.appendleft(track)
+            self.queues.save_queue_state(interaction.guild.id)  # type: ignore[union-attr]
+            msg = f"⏭️ **{track.title}** will play next."
+            if interaction.response.is_done():
+                await interaction.followup.send(msg)
+            else:
+                await interaction.response.send_message(msg)
             return
 
         # Duplicate detection
@@ -1341,7 +1425,7 @@ class MusicCog(commands.Cog):
             await interaction.followup.send(msg)
 
     async def _play_single_url(
-        self, interaction: discord.Interaction, url: str
+        self, interaction: discord.Interaction, url: str, *, play_next: bool = False
     ) -> None:
         """Resolve a single YouTube URL or search query and queue it."""
         try:
@@ -1368,7 +1452,7 @@ class MusicCog(commands.Cog):
             await interaction.followup.send(f"Could not find anything: {exc}")
             return
 
-        await self._enqueue_and_play(interaction, track)
+        await self._enqueue_and_play(interaction, track, play_next=play_next)
 
     # ── commands ─────────────────────────────────────────────────────────
 
@@ -1505,6 +1589,50 @@ class MusicCog(commands.Cog):
             url = value
         await self._play_single_url(interaction, url)
 
+    @app_commands.command(name="playnext", description="Insert a track to play immediately after the current one")
+    @app_commands.describe(query="YouTube URL, Spotify track URL, or search keywords")
+    async def playnext(self, interaction: discord.Interaction, query: str) -> None:
+        input_type, value = classify(query)
+
+        # Reject playlists / streams — playnext is single-track only
+        if input_type in (
+            InputType.YOUTUBE_PLAYLIST,
+            InputType.SPOTIFY_PLAYLIST,
+            InputType.SPOTIFY_ALBUM,
+            InputType.SOUNDCLOUD_PLAYLIST,
+            InputType.RADIO_STREAM,
+        ):
+            await interaction.response.send_message(
+                "❌ `/playnext` only supports single tracks. Use `/play` for playlists.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+
+        # Resolve Spotify track to a search string
+        if input_type == InputType.SPOTIFY_TRACK:
+            if not self.spotify.available:
+                await interaction.followup.send(
+                    "Spotify credentials are not configured.", ephemeral=True
+                )
+                return
+            try:
+                search_strings = await self.bot.loop.run_in_executor(
+                    None, self.spotify.resolve_track, value
+                )
+            except Exception as exc:
+                await interaction.followup.send(f"Spotify error: {exc}")
+                return
+            if not search_strings:
+                await interaction.followup.send("❌ No tracks found from that Spotify link.")
+                return
+            value = f"ytsearch:{search_strings[0]}"
+        elif input_type == InputType.SEARCH_QUERY:
+            value = f"ytsearch:{value}"
+
+        await self._play_single_url(interaction, value, play_next=True)
+
     @app_commands.command(name="stop", description="Stop playback, clear queue, and disconnect")
     async def stop(self, interaction: discord.Interaction) -> None:
         gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
@@ -1567,6 +1695,32 @@ class MusicCog(commands.Cog):
                 color=discord.Color.blurple(),
             )
             await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="myqueue", description="Show only the tracks you have in the queue")
+    async def myqueue(self, interaction: discord.Interaction) -> None:
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        my_tracks = [
+            (i + 1, t) for i, t in enumerate(gq.queue)
+            if t.requester_id == interaction.user.id
+            or (t.requester_id == 0 and t.requester == interaction.user.display_name)
+        ]
+        if not my_tracks:
+            await interaction.response.send_message(
+                "You have no tracks in the queue.", ephemeral=True
+            )
+            return
+        lines = [
+            f"`#{pos}.` {t.title} [{format_duration(t.duration)}]"
+            for pos, t in my_tracks
+        ]
+        s = "s" if len(my_tracks) != 1 else ""
+        embed = discord.Embed(
+            title=f"📋 Your tracks — {interaction.user.display_name}",
+            description="\n".join(lines),
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text=f"{len(my_tracks)} track{s} in queue")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="pause", description="Pause playback")
     async def pause(self, interaction: discord.Interaction) -> None:
@@ -1748,6 +1902,57 @@ class MusicCog(commands.Cog):
         gq.max_queue = size
         self.queues.save_settings()
         await interaction.response.send_message(f"📋 Max queue size set to **{size}** tracks.")
+
+    @app_commands.command(name="maxperuser", description="Set the max tracks a single user can have in the queue (0 = unlimited)")
+    @app_commands.describe(limit="Max tracks per user, 0 to remove the limit")
+    async def maxperuser(self, interaction: discord.Interaction, limit: int) -> None:
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        if err := _check_dj(interaction, gq):
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        if limit < 0:
+            await interaction.response.send_message(
+                "Limit must be 0 or higher.", ephemeral=True
+            )
+            return
+        gq.max_per_user = limit
+        self.queues.save_settings()
+        if limit == 0:
+            await interaction.response.send_message("📋 Per-user queue limit removed.")
+        else:
+            s = "s" if limit != 1 else ""
+            await interaction.response.send_message(
+                f"📋 Each user can now queue up to **{limit}** track{s}."
+            )
+
+    @app_commands.command(name="setnpchannel", description="Set this channel as the dedicated now-playing display channel")
+    async def setnpchannel(self, interaction: discord.Interaction) -> None:
+        if not interaction.user.guild_permissions.manage_channels:  # type: ignore[union-attr]
+            await interaction.response.send_message(
+                "You need the **Manage Channels** permission to use this.", ephemeral=True
+            )
+            return
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        gq.np_channel_id = interaction.channel_id
+        gq.np_message_id = None
+        self.queues.save_settings()
+        await interaction.response.send_message(
+            "📺 Now-playing updates will be posted in this channel when tracks change.\n"
+            "Use `/clearnpchannel` to disable."
+        )
+
+    @app_commands.command(name="clearnpchannel", description="Disable the dedicated now-playing channel")
+    async def clearnpchannel(self, interaction: discord.Interaction) -> None:
+        if not interaction.user.guild_permissions.manage_channels:  # type: ignore[union-attr]
+            await interaction.response.send_message(
+                "You need the **Manage Channels** permission to use this.", ephemeral=True
+            )
+            return
+        gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
+        gq.np_channel_id = None
+        gq.np_message_id = None
+        self.queues.save_settings()
+        await interaction.response.send_message("📺 Now-playing channel cleared.")
 
     @app_commands.command(name="remove", description="Remove a track from the queue")
     @app_commands.describe(position="Position in the queue (1-indexed)")
@@ -1987,7 +2192,7 @@ class MusicCog(commands.Cog):
         await interaction.followup.send(f"🎛️ Filter: **{label}**.")
 
     @app_commands.command(name="seek", description="Seek to a position in the current track")
-    @app_commands.describe(position="Time to seek to (e.g. 90, 1:30, 1:30:00)")
+    @app_commands.describe(position="Absolute (1:30, 90) or relative (+30 or -15 seconds)")
     async def seek(self, interaction: discord.Interaction, position: str) -> None:
         gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
         if err := _check_dj(interaction, gq):
@@ -2002,10 +2207,25 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("Cannot seek in a live stream.", ephemeral=True)
             return
 
+        # Handle relative seek: +30 or -15
+        position = position.strip()
+        relative_dir = 0
+        if position.startswith("+"):
+            relative_dir = 1
+            position = position[1:]
+        elif position.startswith("-"):
+            relative_dir = -1
+            position = position[1:]
+
         secs = parse_time(position)
         if secs is None or secs < 0:
-            await interaction.response.send_message("Invalid time format. Use `90`, `1:30`, or `1:30:00`.", ephemeral=True)
+            await interaction.response.send_message(
+                "Invalid time format. Use `90`, `1:30`, `+30`, or `-15`.", ephemeral=True
+            )
             return
+
+        if relative_dir != 0:
+            secs = max(0, self._get_elapsed(gq) + relative_dir * secs)
 
         if gq.current and gq.current.duration and secs > gq.current.duration:
             await interaction.response.send_message("Seek position is past the end of the track.", ephemeral=True)
@@ -2235,7 +2455,9 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("❌ Nothing is playing. Use `/play` to queue a track.", ephemeral=True)
             return
 
-        ok = self.favorites.add(interaction.user.id, gq.current)
+        ok = self.favorites.add(
+            interaction.user.id, gq.current, guild_id=interaction.guild.id  # type: ignore[union-attr]
+        )
         if ok:
             await interaction.response.send_message(
                 f"Saved **{gq.current.title}** to your favorites."
@@ -2256,10 +2478,17 @@ class MusicCog(commands.Cog):
             )
             return
 
-        lines = [
-            f"`{i + 1}.` {f['title']} [{format_duration(f.get('duration', 0))}]"
-            for i, f in enumerate(favs)
-        ]
+        lines = []
+        current_guild_id = interaction.guild.id if interaction.guild else 0  # type: ignore[union-attr]
+        for i, f in enumerate(favs):
+            fav_guild_id = f.get("guild_id", 0)
+            guild_tag = ""
+            if fav_guild_id and fav_guild_id != current_guild_id:
+                g = self.bot.get_guild(fav_guild_id)
+                guild_tag = f" *[{g.name if g else 'Other Server'}]*"
+            lines.append(
+                f"`{i + 1}.` {f['title']} [{format_duration(f.get('duration', 0))}]{guild_tag}"
+            )
         embed = discord.Embed(
             title=f"❤️ Favorites — {interaction.user.display_name}",
             description="\n".join(lines),
@@ -2280,15 +2509,25 @@ class MusicCog(commands.Cog):
             f"💔 Removed **{removed['title']}** from your favorites."
         )
 
-    @app_commands.command(name="playfavs", description="Queue all your favorite tracks")
+    @app_commands.command(name="playfavs", description="Queue your favorite tracks saved in this server")
     async def playfavs(self, interaction: discord.Interaction) -> None:
-        tracks = self.favorites.as_tracks(
-            interaction.user.id, requester=interaction.user.display_name
+        guild_id = interaction.guild.id  # type: ignore[union-attr]
+        tracks = self.favorites.as_tracks_for_guild(
+            interaction.user.id, guild_id, requester=interaction.user.display_name
         )
         if not tracks:
-            await interaction.response.send_message(
-                "You have no favorites. Use `/fav` to save tracks.", ephemeral=True
-            )
+            # Fallback: check if they have any favs at all (from other servers)
+            all_favs = self.favorites.list(interaction.user.id)
+            if all_favs:
+                await interaction.response.send_message(
+                    "You have no favorites saved in this server. "
+                    "Use `/fav` while music is playing, or check `/favs` to see all your favorites.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "You have no favorites. Use `/fav` to save tracks.", ephemeral=True
+                )
             return
 
         vc = await self._ensure_voice(interaction)
