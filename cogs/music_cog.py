@@ -304,15 +304,15 @@ class DJApprovalView(discord.ui.View):
         if err := _check_dj(interaction, gq):
             await interaction.response.send_message(err, ephemeral=True)
             return
+        # Guard against double-click or approve-after-reject race
+        if self.track not in gq.pending_requests:
+            await interaction.response.send_message("This request was already handled.", ephemeral=True)
+            return
+        gq.pending_requests.remove(self.track)
         pos = gq.add(self.track)
         if pos is None:
             await interaction.response.send_message("Queue is full.", ephemeral=True)
             return
-        # Remove from pending
-        try:
-            gq.pending_requests.remove(self.track)
-        except ValueError:
-            pass
         self._disable_all()
         await interaction.response.edit_message(
             content=f"Approved **{self.track.title}** (position #{pos}).",
@@ -328,10 +328,11 @@ class DJApprovalView(discord.ui.View):
         if err := _check_dj(interaction, gq):
             await interaction.response.send_message(err, ephemeral=True)
             return
-        try:
-            gq.pending_requests.remove(self.track)
-        except ValueError:
-            pass
+        # Guard against double-click or reject-after-approve race
+        if self.track not in gq.pending_requests:
+            await interaction.response.send_message("This request was already handled.", ephemeral=True)
+            return
+        gq.pending_requests.remove(self.track)
         self._disable_all()
         await interaction.response.edit_message(
             content=f"Rejected **{self.track.title}**.",
@@ -2041,6 +2042,9 @@ class MusicCog(commands.Cog):
         if err := _check_dj(interaction, gq):
             await interaction.response.send_message(err, ephemeral=True)
             return
+        if from_pos == to_pos:
+            await interaction.response.send_message("Track is already at that position.", ephemeral=True)
+            return
         moved = gq.move(from_pos - 1, to_pos - 1)
         if moved is None:
             await interaction.response.send_message(
@@ -2933,9 +2937,11 @@ class MusicCog(commands.Cog):
         if gq.current is None:
             await interaction.response.send_message("❌ Nothing is playing. Use `/play` to queue a track.", ephemeral=True)
             return
+        # Capture title now — gq.current can become None during the async Spotify fetch
+        current_title = gq.current.title
         await interaction.response.defer()
         results = await self.bot.loop.run_in_executor(
-            None, lambda: self.spotify.recommend_multiple(gq.current.title, 5)  # type: ignore[union-attr]
+            None, lambda: self.spotify.recommend_multiple(current_title, 5)
         )
         if not results:
             await interaction.followup.send("No similar tracks found.")
@@ -2945,7 +2951,7 @@ class MusicCog(commands.Cog):
             for i, t in enumerate(results)
         ]
         embed = discord.Embed(
-            title=f"Similar to: {gq.current.title}",
+            title=f"Similar to: {current_title}",
             description="\n".join(lines),
             color=discord.Color.green(),
         )
