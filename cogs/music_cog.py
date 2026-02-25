@@ -994,10 +994,11 @@ class MusicCog(commands.Cog):
                     log.warning("Radio recommendation failed: %s", exc)
 
             # Autoplay: recommend a track based on what just played
-            if track is None and gq.autoplay and self.spotify.available and gq.current is not None:
+            # Use gq.previous — next_track() already moved current → previous
+            if track is None and gq.autoplay and self.spotify.available and gq.previous is not None:
                 try:
                     rec = await self.bot.loop.run_in_executor(
-                        None, self.spotify.recommend, gq.current.title
+                        None, self.spotify.recommend, gq.previous.title
                     )
                     if rec:
                         gq.add(rec)
