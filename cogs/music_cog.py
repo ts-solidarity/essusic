@@ -1111,7 +1111,7 @@ class MusicCog(commands.Cog):
                 pass
 
         try:
-            msg = await channel.send(embed=embed, view=view)  # type: ignore[union-attr]
+            msg = await channel.send(embed=embed, view=view, silent=True)  # type: ignore[union-attr]
             view.message = msg
             view._update_task = asyncio.create_task(view._auto_update())
         except discord.HTTPException:
