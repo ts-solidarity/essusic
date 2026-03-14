@@ -1103,17 +1103,7 @@ class MusicCog(commands.Cog):
         embed = view._build_embed()
         view._sync_pause_button()
 
-        # Edit the existing message in-place to avoid a new notification
-        if old and old.message and old.message.channel.id == gq.text_channel_id:
-            try:
-                await old.message.edit(embed=embed, view=view)
-                view.message = old.message
-                view._update_task = asyncio.create_task(view._auto_update())
-                return
-            except discord.HTTPException:
-                pass  # message gone — fall through to send new
-
-        # Different channel or no previous message — delete old and send new
+        # Always delete old message and send a new one at the bottom
         if old and old.message:
             try:
                 await old.message.delete()
