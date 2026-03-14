@@ -32,8 +32,8 @@ class SpotifyResolver:
         return self._sp is not None
 
     def _format_track(self, track: dict) -> str:
-        artists = ", ".join(a["name"] for a in track["artists"])
-        return f"{artists} - {track['name']}"
+        artists = ", ".join(a.get("name", "Unknown") for a in track.get("artists", []))
+        return f"{artists} - {track.get('name', 'Unknown')}"
 
     def _track_to_info(self, track: dict) -> TrackInfo:
         title = self._format_track(track)
@@ -41,7 +41,7 @@ class SpotifyResolver:
             title=title,
             url=f"ytsearch:{title}",
             duration=track.get("duration_ms", 0) // 1000,
-            artist=", ".join(a["name"] for a in track.get("artists", [])),
+            artist=", ".join(a.get("name", "Unknown") for a in track.get("artists", [])),
         )
 
     def search(self, query: str, limit: int = 5) -> list[TrackInfo]:
@@ -51,8 +51,8 @@ class SpotifyResolver:
         results = self._sp.search(q=query, type="track", limit=limit)
         tracks: list[TrackInfo] = []
         for item in results.get("tracks", {}).get("items", []):
-            artist_names = ", ".join(a["name"] for a in item["artists"])
-            title = f"{artist_names} - {item['name']}"
+            artist_names = ", ".join(a.get("name", "Unknown") for a in item.get("artists", []))
+            title = f"{artist_names} - {item.get('name', 'Unknown')}"
             duration_ms = item.get("duration_ms", 0)
             tracks.append(
                 TrackInfo(
@@ -97,11 +97,14 @@ class SpotifyResolver:
             except Exception:
                 continue
             for track in top.get("tracks", []):
-                tid = track["id"]
-                if tid in exclude_ids:
+                tid = track.get("id")
+                if not tid or tid in exclude_ids:
                     continue
                 exclude_ids.add(tid)
-                out.append((tid, self._track_to_info(track)))
+                try:
+                    out.append((tid, self._track_to_info(track)))
+                except (KeyError, TypeError):
+                    continue
                 if len(out) >= limit:
                     break
         return out
@@ -155,7 +158,11 @@ class SpotifyResolver:
     def resolve_track(self, track_id: str) -> list[str]:
         if not self._sp:
             return []
-        track = self._sp.track(track_id)
+        try:
+            track = self._sp.track(track_id)
+        except Exception as exc:
+            log.warning("Spotify resolve_track failed: %s", exc)
+            return []
         return [self._format_track(track)]
 
     def resolve_playlist(self, playlist_id: str) -> list[str]:
@@ -164,11 +171,11 @@ class SpotifyResolver:
         results: list[str] = []
         resp = self._sp.playlist_tracks(playlist_id)
         while resp:
-            for item in resp["items"]:
+            for item in resp.get("items", []):
                 track = item.get("track")
                 if track:
                     results.append(self._format_track(track))
-            resp = self._sp.next(resp) if resp["next"] else None
+            resp = self._sp.next(resp) if resp.get("next") else None
         return results
 
     def resolve_album(self, album_id: str) -> list[str]:
@@ -177,8 +184,8 @@ class SpotifyResolver:
         results: list[str] = []
         resp = self._sp.album_tracks(album_id)
         while resp:
-            for track in resp["items"]:
-                artists = ", ".join(a["name"] for a in track["artists"])
-                results.append(f"{artists} - {track['name']}")
-            resp = self._sp.next(resp) if resp["next"] else None
+            for track in resp.get("items", []):
+                artists = ", ".join(a.get("name", "Unknown") for a in track.get("artists", []))
+                results.append(f"{artists} - {track.get('name', 'Unknown')}")
+            resp = self._sp.next(resp) if resp.get("next") else None
         return results

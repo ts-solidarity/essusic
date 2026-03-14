@@ -399,7 +399,7 @@ class HistoryManager:
         counts: Counter[str] = Counter()
         url_map: dict[str, str] = {}
         for e in entries:
-            title = e["title"]
+            title = e.get("title", "Unknown")
             counts[title] += 1
             url_map[title] = e.get("url", "")
         return [(t, url_map[t], c) for t, c in counts.most_common(limit)]

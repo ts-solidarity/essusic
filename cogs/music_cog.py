@@ -1749,7 +1749,7 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message(err, ephemeral=True)
             return
         vc: Optional[discord.VoiceClient] = interaction.guild.voice_client  # type: ignore[union-attr, assignment]
-        if vc is None or not vc.is_playing():
+        if vc is None or (not vc.is_playing() and not vc.is_paused()):
             await interaction.response.send_message("❌ Nothing is playing. Use `/play` to queue a track.", ephemeral=True)
             return
 
@@ -2085,6 +2085,7 @@ class MusicCog(commands.Cog):
         if from_pos == to_pos:
             await interaction.response.send_message("Track is already at that position.", ephemeral=True)
             return
+        gq.snapshot(f"Move #{from_pos} to #{to_pos}")
         moved = gq.move(from_pos - 1, to_pos - 1)
         if moved is None:
             await interaction.response.send_message(
@@ -2221,7 +2222,7 @@ class MusicCog(commands.Cog):
     @app_commands.command(name="replay", description="Restart the current track from the beginning")
     async def replay(self, interaction: discord.Interaction) -> None:
         vc: Optional[discord.VoiceClient] = interaction.guild.voice_client  # type: ignore[union-attr, assignment]
-        if vc is None or not vc.is_playing():
+        if vc is None or (not vc.is_playing() and not vc.is_paused()):
             await interaction.response.send_message("❌ Nothing is playing. Use `/play` to queue a track.", ephemeral=True)
             return
         gq = self.queues.get(interaction.guild.id)  # type: ignore[union-attr]
@@ -2278,7 +2279,7 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message(err, ephemeral=True)
             return
         vc: Optional[discord.VoiceClient] = interaction.guild.voice_client  # type: ignore[union-attr, assignment]
-        if vc is None or not vc.is_playing():
+        if vc is None or (not vc.is_playing() and not vc.is_paused()):
             await interaction.response.send_message("❌ Nothing is playing. Use `/play` to queue a track.", ephemeral=True)
             return
         if gq.current and gq.current.is_live:
@@ -2303,7 +2304,7 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message(err, ephemeral=True)
             return
         vc: Optional[discord.VoiceClient] = interaction.guild.voice_client  # type: ignore[union-attr, assignment]
-        if vc is None or not vc.is_playing():
+        if vc is None or (not vc.is_playing() and not vc.is_paused()):
             await interaction.response.send_message("❌ Nothing is playing. Use `/play` to queue a track.", ephemeral=True)
             return
 
@@ -2347,7 +2348,7 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message(err, ephemeral=True)
             return
         vc: Optional[discord.VoiceClient] = interaction.guild.voice_client  # type: ignore[union-attr, assignment]
-        if vc is None or not vc.is_playing():
+        if vc is None or (not vc.is_playing() and not vc.is_paused()):
             await interaction.response.send_message("❌ Nothing is playing. Use `/play` to queue a track.", ephemeral=True)
             return
         if not 0.5 <= rate <= 2.0:
@@ -2374,7 +2375,7 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message(err, ephemeral=True)
             return
         vc: Optional[discord.VoiceClient] = interaction.guild.voice_client  # type: ignore[union-attr, assignment]
-        if vc is None or not vc.is_playing():
+        if vc is None or (not vc.is_playing() and not vc.is_paused()):
             await interaction.response.send_message("❌ Nothing is playing. Use `/play` to queue a track.", ephemeral=True)
             return
         if gq.current and gq.current.is_live:
@@ -2501,7 +2502,7 @@ class MusicCog(commands.Cog):
     @app_commands.command(name="voteskip", description="Start a skip vote — requires half the listeners to agree")
     async def voteskip(self, interaction: discord.Interaction) -> None:
         vc: Optional[discord.VoiceClient] = interaction.guild.voice_client  # type: ignore[union-attr, assignment]
-        if vc is None or not vc.is_playing():
+        if vc is None or (not vc.is_playing() and not vc.is_paused()):
             await interaction.response.send_message("❌ Nothing is playing. Use `/play` to queue a track.", ephemeral=True)
             return
 
@@ -2932,7 +2933,7 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message(err, ephemeral=True)
             return
         vc: Optional[discord.VoiceClient] = interaction.guild.voice_client  # type: ignore[union-attr, assignment]
-        if vc is None or not vc.is_playing():
+        if vc is None or (not vc.is_playing() and not vc.is_paused()):
             await interaction.response.send_message("❌ Nothing is playing. Use `/play` to queue a track.", ephemeral=True)
             return
         gq.eq_bands = list(EQ_PRESETS[preset])
@@ -2956,7 +2957,7 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message("Gain must be -12 to +12 dB.", ephemeral=True)
             return
         vc: Optional[discord.VoiceClient] = interaction.guild.voice_client  # type: ignore[union-attr, assignment]
-        if vc is None or not vc.is_playing():
+        if vc is None or (not vc.is_playing() and not vc.is_paused()):
             await interaction.response.send_message("❌ Nothing is playing. Use `/play` to queue a track.", ephemeral=True)
             return
         gq.eq_bands[band - 1] = gain

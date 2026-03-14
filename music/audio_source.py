@@ -118,7 +118,11 @@ class YTDLSource(discord.PCMVolumeTransformer):
             None, lambda: ytdl.extract_info(query, download=False)
         )
 
+        if data is None:
+            raise ValueError("No results found")
         if "entries" in data:
+            if not data["entries"]:
+                raise ValueError("No results found")
             data = data["entries"][0]
 
         url = data["url"]
