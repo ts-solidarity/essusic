@@ -523,10 +523,8 @@ class PlayerView(discord.ui.View):
         gq.queue.appendleft(track)
         gq.current = None
         if vc:
-            vc.stop()
+            vc.stop()  # _play_next will handle player update via _send_player
         await interaction.response.defer()
-        await asyncio.sleep(1.5)
-        await self._update_player()
 
     @discord.ui.button(emoji="\u23ea", style=discord.ButtonStyle.secondary, row=0)
     async def rewind_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -591,10 +589,8 @@ class PlayerView(discord.ui.View):
         if vc is None or (not vc.is_playing() and not vc.is_paused()):
             await interaction.response.send_message("❌ Nothing is playing. Use `/play` to queue a track.", ephemeral=True)
             return
-        vc.stop()
+        vc.stop()  # _play_next will handle player update via _send_player
         await interaction.response.defer()
-        await asyncio.sleep(1.5)
-        await self._update_player()
 
     # Row 2: volume controls
 
@@ -1758,8 +1754,12 @@ class MusicCog(commands.Cog):
             return
 
         title = gq.current.title if gq.current else "current track"
+        next_up = gq.queue[0].title if gq.queue else None
         vc.stop()  # triggers _after_play → _play_next
-        await interaction.response.send_message(f"Skipped **{title}**.")
+        msg = f"Skipped **{title}**."
+        if next_up:
+            msg += f" Now playing **{next_up}**."
+        await interaction.response.send_message(msg)
 
     @app_commands.command(name="queue", description="Show the current queue")
     async def queue(self, interaction: discord.Interaction) -> None:
